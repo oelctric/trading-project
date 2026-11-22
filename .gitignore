@@ -1,0 +1,58 @@
+# --- Secrets / credentials ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# --- Large data, datasets & trained models (multi-GB, regenerate locally) ---
+artifacts/
+backtest_data/
+*.npz
+*.npy
+*.pt
+*.pth
+*.ckpt
+*.h5
+*.pkl
+*.parquet
+
+# --- Runtime output: logs, pids, state, trade records ---
+logs/
+*.log
+*.pid
+*_log.txt
+*_err.txt
+debug.txt
+trades.csv
+backtest_trades.csv
+backtest_results.txt
+paper_state.json
+
+# --- Local agent / tool state ---
+.openclaude/
+.claude/settings.local.json
+.playwright-mcp/
+.agents/
+
+# --- Node (browser extension) ---
+node_modules/
+dist/
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp

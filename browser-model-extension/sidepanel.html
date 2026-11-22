@@ -1,0 +1,77 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <link rel="stylesheet" href="sidepanel.css" />
+</head>
+<body>
+  <div class="topbar">
+    <span class="title">Browser Agent</span>
+    <div class="topbtns">
+      <button id="newchat" class="icon" title="New chat">＋</button>
+      <button id="gear" class="icon" title="Settings">⚙</button>
+    </div>
+  </div>
+
+  <details id="settings">
+    <summary>Connection &amp; options</summary>
+    <label>Model endpoint (OpenAI-compatible base URL)</label>
+    <input id="baseUrl" type="text" placeholder="http://192.168.50.213:1234/v1" />
+
+    <label>Model name</label>
+    <select id="model">
+      <option value="">Detect models…</option>
+    </select>
+
+    <label>API key (optional — LM Studio ignores it)</label>
+    <input id="apiKey" type="password" placeholder="not required for LM Studio" />
+
+    <label>Max agent steps</label>
+    <input id="maxSteps" type="number" value="15" min="1" max="50" />
+
+    <label class="check">
+      <input id="vision" type="checkbox" checked />
+      Vision — let the model take screenshots (turn OFF for text-only models that can't see images).
+    </label>
+
+    <label class="check">
+      <input id="simple" type="checkbox" />
+      Simple mode — fewer tools (read, click, type, navigate, scroll). Best for small/weaker models.
+    </label>
+
+    <label class="check">
+      <input id="auto" type="checkbox" />
+      Auto mode — keep going past the step limit until the task is finished (up to a safety cap).
+    </label>
+
+    <label class="check">
+      <input id="trusted" type="checkbox" />
+      High-realism input (trusted) — uses the debugger for real mouse/keyboard events. Shows a "debugging this browser" banner while running.
+    </label>
+
+    <div class="row">
+      <button id="save" class="secondary">Save</button>
+      <button id="test" class="secondary">Test connection</button>
+    </div>
+    <div class="row">
+      <button id="copydebug" class="secondary">📋 Copy debug log</button>
+    </div>
+    <p class="hint">Copies exactly what the model saw &amp; did (page text, elements, tool calls, errors) so you can paste it for troubleshooting.</p>
+  </details>
+
+  <div id="chat" class="chat"></div>
+
+  <div id="working" class="working" hidden>
+    <span class="spinner"></span>
+    <span class="working-text"><span id="workLabel">Agent is working</span><span class="ell"></span></span>
+  </div>
+
+  <div class="composer">
+    <textarea id="task" rows="1" placeholder="Tell the agent what to do…"></textarea>
+    <button id="run" title="Send">➤</button>
+    <button id="stop" class="secondary" title="Stop" disabled>■</button>
+  </div>
+
+  <script src="sidepanel.js"></script>
+</body>
+</html>

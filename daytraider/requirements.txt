@@ -1,0 +1,10 @@
+torch
+pandas
+numpy
+yfinance
+scikit-learn
+alpaca-py
+python-dotenv
+matplotlib
+pynacl
+requests
