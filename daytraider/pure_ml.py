@@ -35,12 +35,19 @@ def summarize(label, rets):
 
 
 def main():
-    X, y, ret_long, ret_short, setups = load_dataset()["test"]
+    ds = load_dataset()
+    X, y, ret_long, ret_short, setups = ds["test"]
     scaler = Scaler.load()
     models = load_ensemble()
-    Xt = torch.from_numpy(scaler.transform(X))
-    probs = torch.cat([ensemble_probs(models, Xt[i:i + 4096])
-                       for i in range(0, len(Xt), 4096)]).numpy()
+
+    def predict(arr):
+        t = torch.from_numpy(scaler.transform(arr))
+        return torch.cat([ensemble_probs(models, t[i:i + 4096])
+                          for i in range(0, len(t), 4096)]).numpy()
+    probs = predict(X)
+    # Band cut-offs come from VALIDATION predictions - percentiles of the
+    # test set's own predictions would peek at the test distribution.
+    val_probs = predict(ds["val"][0])
     cost = config.COST_PER_TRADE
 
     print(f"Test bars: {len(probs)}\n")
@@ -60,8 +67,8 @@ def main():
     # Sweep symmetric probability bands. Longs where prob is highest,
     # shorts where it is lowest; the width controls selectivity.
     for pct in (30, 20, 10, 5):
-        hi = np.percentile(probs, 100 - pct)
-        lo = np.percentile(probs, pct)
+        hi = np.percentile(val_probs, 100 - pct)
+        lo = np.percentile(val_probs, pct)
         long_r = ret_long[probs >= hi] - cost
         short_r = ret_short[probs <= lo] - cost
         both = np.concatenate([long_r, short_r])
@@ -69,7 +76,7 @@ def main():
 
     print("\n=== PURE-ML restricted to its most confident longs only ===")
     for pct in (10, 5, 2):
-        hi = np.percentile(probs, 100 - pct)
+        hi = np.percentile(val_probs, 100 - pct)
         summarize(f"top {pct}% prob -> long", ret_long[probs >= hi] - cost)
 
     # Reference: how often would each even be tradable per day?

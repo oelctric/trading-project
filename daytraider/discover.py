@@ -41,7 +41,9 @@ def build_panel() -> pd.DataFrame:
             print(f"  skipping {ticker}: {e}")
             continue
         print(f"  {ticker}: {len(f)} bars")
-        cols = RULE_FEATURES + ["trade_ret", "trade_ret_short"]
+        # score on the TRAILING exit the live bot actually trades (was the
+        # fixed bracket, a different exit than the one the gate/bot use)
+        cols = RULE_FEATURES + ["trail_ret", "trail_ret_short"]
         frames.append(f[cols].dropna())
     return pd.concat(frames).sort_index()
 
@@ -66,7 +68,7 @@ def main():
         f1, op1, t1, f2, op2, t2, side = rule
         m = (df[f1] > t1) if op1 == ">" else (df[f1] < t1)
         m &= (df[f2] > t2) if op2 == ">" else (df[f2] < t2)
-        rets = df["trade_ret_short"] if side == "short" else df["trade_ret"]
+        rets = df["trail_ret_short"] if side == "short" else df["trail_ret"]
         r = rets[m] - config.COST_PER_TRADE
         return r
 

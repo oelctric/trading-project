@@ -316,7 +316,11 @@ async function copyDebug() {
 // --- Events ---
 $("copydebug").addEventListener("click", copyDebug);
 $("run").addEventListener("click", send);
-$("stop").addEventListener("click", () => { if (port) port.postMessage({ type: "stop" }); setRunning(false); });
+$("stop").addEventListener("click", () => {
+  if (!port) connect();            // the port drops when the popup closes - reconnect so Stop is delivered
+  port.postMessage({ type: "stop" });
+  setRunning(false);
+});
 $("task").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } });
 $("task").addEventListener("input", () => {
   $("task").style.height = "auto";
@@ -327,7 +331,7 @@ $("gear").addEventListener("click", () => { $("settings").open = !$("settings").
 $("baseUrl").addEventListener("change", populateModels);
 $("apiKey").addEventListener("change", populateModels);
 $("save").addEventListener("click", async () => { await saveSettings(); await populateModels(true); }); // preserve selected model on save
-$("test").addEventListener("click", async () => { await populateModels(); if (!port) connect(); port.postMessage({ type: "test", cfg: cfg() }); });
+$("test").addEventListener("click", async () => { await populateModels(true); if (!port) connect(); port.postMessage({ type: "test", cfg: cfg() }); });
 
 // Live updates: the transcript and running flag live in storage.
 chrome.storage.onChanged.addListener((changes, area) => {

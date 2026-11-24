@@ -19,32 +19,54 @@ DATE_FORMAT = "%H:%M:%S"
 logger_instance: logging.Logger | None = None
 
 
+class DailyFileHandler(logging.FileHandler):
+    """Writes to logs/trader_<YYYY-MM-DD>.log and switches file at midnight, so a
+    bot that runs for days doesn't pile everything into its start day's file."""
+
+    def __init__(self, log_dir: str):
+        self.log_dir = log_dir
+        self.day = datetime.now().strftime("%Y-%m-%d")
+        super().__init__(self._path(), mode="a", encoding="utf-8")
+
+    def _path(self) -> str:
+        return os.path.join(self.log_dir, f"trader_{self.day}.log")
+
+    def emit(self, record: logging.LogRecord) -> None:
+        today = datetime.now().strftime("%Y-%m-%d")
+        if today != self.day:
+            self.acquire()
+            try:
+                self.close()
+                self.day = today
+                self.baseFilename = os.path.abspath(self._path())
+                self.stream = self._open()
+            finally:
+                self.release()
+        super().emit(record)
+
+
 def setup_logger(
     name: str = "minittraider",
     level: str = "INFO",
     log_file: str | None = None,
 ) -> logging.Logger:
+    """Create the logger once, but ALWAYS honour a later request for a file
+    handler / level (modules call get_logger() at import time, before trader.py
+    asks for file logging - that request used to be silently ignored)."""
     global logger_instance
-    if logger_instance:
-        return logger_instance
-
-    logger = logging.getLogger(name)
+    formatter = logging.Formatter(LOG_FORMAT, datefmt=DATE_FORMAT)
+    logger = logger_instance or logging.getLogger(name)
+    if logger_instance is None:
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
+        logger_instance = logger
     logger.setLevel(getattr(logging, level.upper(), logging.INFO))
 
-    formatter = logging.Formatter(LOG_FORMAT, datefmt=DATE_FORMAT)
-
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
-
-    if log_file:
-        file_handler = logging.FileHandler(
-            log_file, mode="a", encoding="utf-8"
-        )
+    if log_file and not any(isinstance(h, logging.FileHandler) for h in logger.handlers):
+        file_handler = DailyFileHandler(os.path.dirname(log_file))
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
-
-    logger_instance = logger
     return logger
 
 

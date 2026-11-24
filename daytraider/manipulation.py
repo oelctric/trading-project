@@ -32,12 +32,14 @@ def bar_flags(df: pd.DataFrame) -> pd.DataFrame:
     # Stop-hunt / liquidity grab: price pokes through yesterday's high (or
     # low) or the opening-range extreme, then closes back inside on a long
     # rejection wick. The stops beyond the level were the target.
-    poked_high = ((df["pdh_dist"].shift(1) < 0) & (high > df["high"].shift(1))
-                  & (close < df["high"].shift(1)))
+    # (pdh/pdl levels rebuilt from the distance features: dist = close/level - 1;
+    # this used to compare against the PREVIOUS BAR's high/low instead.)
+    pdh = close / (1 + df["pdh_dist"])
+    pdl = close / (1 + df["pdl_dist"])
+    poked_high = (close.shift(1) < pdh) & (high > pdh) & (close < pdh)
     long_upper = df["upper_wick"] * close > 0.6 * rng
     out["stophunt_high"] = (poked_high & long_upper).fillna(False).astype(int)
-    poked_low = ((df["pdl_dist"].shift(1) > 0) & (low < df["low"].shift(1))
-                 & (close > df["low"].shift(1)))
+    poked_low = (close.shift(1) > pdl) & (low < pdl) & (close > pdl)
     long_lower = df["lower_wick"] * close > 0.6 * rng
     out["stophunt_low"] = (poked_low & long_lower).fillna(False).astype(int)
 
@@ -48,13 +50,15 @@ def bar_flags(df: pd.DataFrame) -> pd.DataFrame:
                          ).fillna(False).astype(int)
 
     # Fake breakout: new 20-bar high on WEAK volume that closes back below
-    # the breakout level within two bars (trap for breakout buyers).
+    # the breakout level - on the same bar, or on the bar right after a weak
+    # breakout. CAUSAL: it used to check the NEXT bar (failed.shift(-1)),
+    # which peeks at the future in backtests and is impossible live.
     hi20 = high.rolling(20).max().shift(1)
-    broke = high > hi20
-    failed = close < hi20
-    out["fake_breakout"] = ((broke & (df["vol_z"] < 0)
-                            & (failed | failed.shift(-1)))
-                           .fillna(False).astype(int))
+    weak_break = (high > hi20) & (df["vol_z"] < 0)
+    failed_now = close < hi20
+    failed_after = weak_break.shift(1, fill_value=False) & (close < hi20.shift(1))
+    out["fake_breakout"] = ((weak_break & failed_now) | failed_after
+                            ).fillna(False).astype(int)
 
     # Effort/result divergence: big volume, price barely nets anywhere over
     # 3 bars — churn that often precedes a manipulated move.

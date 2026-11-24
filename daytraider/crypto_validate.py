@@ -23,7 +23,10 @@ from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 COINS = ["BTC/USD", "ETH/USD", "SOL/USD", "LTC/USD", "LINK/USD",
          "AVAX/USD", "DOGE/USD", "UNI/USD", "AAVE/USD", "DOT/USD",
          "BCH/USD", "XRP/USD", "MKR/USD", "GRT/USD", "SUSHI/USD"]
-MAKER = 15 / 1e4       # limit-order fee assumption
+# Round-trip cost as the live bot trades: maker LIMIT entry (~0.15%) + MARKET
+# exit when the trailing stop hits (taker ~0.25%). This used to charge only
+# the 15 bps maker fee, understating the cost of every trade by ~25 bps.
+MAKER = 40 / 1e4
 TP_A, SL_A, TRAIL_A, H = 1.5, 1.0, 1.0, 8
 
 

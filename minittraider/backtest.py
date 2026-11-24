@@ -31,7 +31,7 @@ import yfinance as yf
 
 import config
 from bounce import decide_bounce
-from brain import decide, fmt_price
+from brain import decide
 from cognitive import decide_cognitive
 from signals import atr
 
@@ -286,9 +286,32 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=14)
     ap.add_argument("--symbols", nargs="*", default=None)
-    ap.add_argument("--strategy", choices=["confluence", "bounce", "cognitive"],
-                    default=config.STRATEGY)
-    args = ap.parse_args()
+    # default to the minute strategies this script documents; the swing
+    # strategy (the live default) has its own backtester - backtest_swing.py,
+    # also reachable here with --strategy swing
+    ap.add_argument("--strategy", choices=["confluence", "bounce", "cognitive", "swing"],
+                    default="cognitive" if config.STRATEGY == config.Strategy.SWING
+                    else config.STRATEGY.value)
+    args, unknown = ap.parse_known_args()
+    if unknown and args.strategy != "swing":
+        ap.error(f"unrecognized arguments: {' '.join(unknown)}")
+    if args.strategy == "swing":
+        import backtest_swing
+        # forward the options backtest_swing understands; --strategy is ours
+        fwd, skip = [], False
+        for a in sys.argv[1:]:
+            if skip:
+                skip = False
+                continue
+            if a == "--strategy":
+                skip = True
+                continue
+            if a.startswith("--strategy="):
+                continue
+            fwd.append(a)
+        sys.argv = [sys.argv[0]] + fwd
+        backtest_swing.main()
+        return
 
     crypto = ["BTC-USD", "ETH-USD", "SOL-USD"]
     stocks = ["SPY", "TSLA", "NVDA"]

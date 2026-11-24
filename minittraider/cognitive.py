@@ -252,7 +252,8 @@ def decide_cognitive(symbol: str, df, walls=None, tape=None,
 
     # 4. risk veto - the only layer with absolute authority
     risk = risk or _default_risk()
-    veto = risk.veto(side, s.price, stop, target, equity)
+    bar_time = df.index[-1].to_pydatetime() if hasattr(df.index[-1], "to_pydatetime") else None
+    veto = risk.veto(side, s.price, stop, target, equity, now=bar_time)
     if veto:
         d.reasons.append(f"=> BLOCKED by risk manager: {veto}")
         return d

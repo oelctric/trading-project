@@ -40,6 +40,10 @@ def collect_trades() -> pd.DataFrame:
         universe, label = config.TICKERS, "in-sample"
     print(f"  universe: {label} ({len(universe)} tickers)")
     rows = []
+    # Evaluate the strategies the live bot can actually trade (it trades
+    # ACTIVE_STRATEGIES & gated-in); --all includes the disabled ones too.
+    names = STRATEGY_NAMES if "--all" in sys.argv else \
+        [s for s in STRATEGY_NAMES if s in config.ACTIVE_STRATEGIES]
     for ticker in universe:
         try:
             feats = compute_features(download_bars(ticker))
@@ -47,7 +51,7 @@ def collect_trades() -> pd.DataFrame:
             print(f"  skipping {ticker}: {e}")
             continue
         print(f"  {ticker}: {len(feats)} bars")
-        for name in STRATEGY_NAMES:
+        for name in names:
             rcol = "trail_ret_short" if is_short(name) else "trail_ret"
             fired = feats[(feats[f"setup_{name}"] > 0) & feats[rcol].notna()]
             for ts, row in fired.iterrows():
@@ -84,9 +88,9 @@ def main():
 
     # each gate = (90d metric) AND (30d net sum > 0 fast cut)
     GATES = {
-        "raw-sum (current)": "sum",
+        "raw-sum": "sum",
         "profit-factor>1.2": "pf",
-        "mean/std>0.1": "musig",
+        "mean/std>0.1 (live)": "musig",
         "expectancy+hit>40%": "exphit",
     }
     frames = {g: [] for g in GATES}
@@ -115,7 +119,7 @@ def main():
               f"{(mr>0).mean():7.0%} {conc:6.0%} {mr.sum():+8.2f}")
 
     print("\nPer-strategy trailing-return edge (full period, net):")
-    for name in STRATEGY_NAMES:
+    for name in sorted(trades["strategy"].unique(), key=STRATEGY_NAMES.index):
         g = trades[trades["strategy"] == name]["net"]
         print(f"  {name:14s} n={len(g):6d}  avg={g.mean()*1e4:+6.1f} bps  "
               f"hit={(g>0).mean():.3f}  sum={g.sum():+.2f}")

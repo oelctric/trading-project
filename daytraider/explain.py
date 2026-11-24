@@ -17,19 +17,25 @@ from data import FEATURE_COLUMNS, load_dataset
 from model import Scaler, ensemble_probs, load_ensemble
 
 
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
 def acc(models, X, y):
-    p = torch.cat([ensemble_probs(models, X[i:i + 4096])
+    p = torch.cat([ensemble_probs(models, X[i:i + 4096].to(DEVICE)).cpu()
                    for i in range(0, len(X), 4096)]).numpy()
     return ((p > 0.5) == (y > 0.5)).mean()
 
 
 def main():
-    X, y, *_ = load_dataset()["test"]
+    # VALIDATION split, not test: features get SELECTED from this ranking
+    # (pure_ml_slim.py), so measuring it on test would leak the test set into
+    # model selection and flatter every later test score.
+    X, y, *_ = load_dataset()["val"]
     scaler = Scaler.load()
-    models = load_ensemble()
+    models = [m.to(DEVICE) for m in load_ensemble()]
     Xs = scaler.transform(X)
     base = acc(models, torch.from_numpy(Xs), y)
-    print(f"Baseline test accuracy: {base:.4f}\n")
+    print(f"Baseline validation accuracy: {base:.4f}\n")
 
     rng = np.random.default_rng(0)
     drops = []

@@ -7,7 +7,7 @@ heavier regularization, then re-runs the pure-ML entry race to see whether
 the network alone can finally clear break-even.
 
 Self-contained: slices the cached dataset's feature axis (no re-download),
-saves to artifacts/slim_* so the live model is untouched.
+nothing is saved, so the live model is untouched.
 
 Usage: python pure_ml_slim.py
 """
@@ -22,11 +22,14 @@ import config
 from data import FEATURE_COLUMNS, load_dataset
 from model import DayTraderNet, Scaler
 
-# Features with clearly positive importance in explain.py (the ones the
-# network actually reasons from). Everything else was noise or harmful.
-SLIM = ["vix_trend", "vix_z", "macd_hist", "pdl_dist", "down_streak",
-        "vix_chg", "mkt_above_vwap", "body_pct", "vol_z", "pdc_dist",
-        "pdh_dist", "clv", "effort_result", "doji", "upper_wick"]
+# Features with clearly positive importance (> +5 bps accuracy drop when
+# shuffled) in explain.py, measured on the VALIDATION split with the ensemble
+# trained on the final labels (session-capped, last-bar-of-session = NaN).
+# Earlier lists were artifacts: one came from a TEST-split ranking, the next
+# from labels that marked every session's last bar a fake loss (which made
+# hour-of-day look like +190 bps; with honest labels it is +6..+18).
+SLIM = ["vix_z", "sma50_dist", "effort_result", "hour_cos", "setup_gap_fade_dn",
+        "down_streak", "upper_wick", "hammer", "clv", "hour_sin"]
 IDX = [FEATURE_COLUMNS.index(f) for f in SLIM]
 SEEDS = [0, 1, 2, 3, 4]
 
@@ -100,6 +103,7 @@ def main():
     print("Training slim regularized ensemble...")
     models = [train_seed(s, Xtr, ytr, Xva, yva, device) for s in SEEDS]
     p = probs(models, Xte, device)
+    pv = probs(models, Xva, device)   # band cut-offs from validation, not test
     acc = ((p > 0.5) == (yte > 0.5)).mean()
     print(f"\nSlim ensemble test accuracy: {acc:.4f} "
           f"(base {max(yte.mean(), 1-yte.mean()):.4f})")
@@ -107,12 +111,12 @@ def main():
     cost = config.COST_PER_TRADE
     print("\n=== PURE-ML (slim model) entry race ===")
     for pct in (30, 20, 10, 5, 2):
-        hi = np.percentile(p, 100 - pct)
-        lo = np.percentile(p, pct)
+        hi = np.percentile(pv, 100 - pct)
+        lo = np.percentile(pv, pct)
         both = np.concatenate([ret_long[p >= hi] - cost,
                                ret_short[p <= lo] - cost])
         summarize(f"top/bottom {pct}% long+short", both)
-    print("  (compare: full 54-feat pure-ML was -8 to -10 bps at these bands)")
+    print("  (compare against `python pure_ml.py` on the same test set)")
 
 
 if __name__ == "__main__":

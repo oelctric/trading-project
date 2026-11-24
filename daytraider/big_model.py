@@ -44,8 +44,8 @@ EXPANDED = [
 
 def build_expanded_dataset():
     """Fetch the expanded universe, build sequences, chronological split.
-    Cached separately (dataset_big.npz) so it never touches the live cache."""
-    cache = config.MODEL_DIR / "dataset_big.npz"
+    Cached separately (dataset_big_v3.npz) so it never touches the live cache."""
+    cache = config.MODEL_DIR / "dataset_big_v3.npz"   # bump when label logic changes
     if cache.exists():
         import time
         if (time.time() - cache.stat().st_mtime) / 3600 < 12:
@@ -61,8 +61,14 @@ def build_expanded_dataset():
             print(f"  skip {t}: {e}"); continue
         n = len(f)
         i_tr, i_va = int(n * config.TRAIN_FRAC), int(n * (config.TRAIN_FRAC + config.VAL_FRAC))
-        for name, part in {"train": f.iloc[:i_tr], "val": f.iloc[i_tr:i_va],
-                           "test": f.iloc[i_va:]}.items():
+        parts = {"train": f.iloc[:i_tr].copy(), "val": f.iloc[i_tr:i_va].copy(),
+                 "test": f.iloc[i_va:]}
+        # purge labels that look across a split boundary (same as load_dataset)
+        label_cols = ["trade_ret", "trade_ret_short", "trail_ret", "trail_ret_short"]
+        for name in ("train", "val"):
+            p = parts[name]
+            p.loc[p.index[-config.LABEL_HORIZON:], label_cols] = np.nan
+        for name, part in parts.items():
             splits[name].append(build_sequences(part))
     out = {n: tuple(np.concatenate([c[i] for c in chunks]) for i in range(5))
            for n, chunks in splits.items()}
@@ -165,16 +171,30 @@ def main():
                                    weights_only=True))
     _, te_acc = evaluate(big, Xte, yte, device)
     _, tr_acc = evaluate(big, Xtr[:20000], ytr[:20000], device)
-    print(f"\n=== RESULT ===")
+    print("\n=== RESULT ===")
     print(f"BIG model ({n_params(big):,} params):")
     print(f"  train acc {tr_acc:.3f}  vs  test acc {te_acc:.3f}  "
           f"(base rate {base:.3f})")
     gap = tr_acc - te_acc
     print(f"  train-minus-test gap: {gap:+.3f}  "
           f"({'OVERFIT' if gap > 0.03 else 'ok'})")
-    print(f"  production small ensemble test acc was ~0.556")
-    print(f"  => bigger brain {'LOST to' if te_acc < 0.556 else 'matched'} "
-          f"the tiny one out-of-sample")
+    if more:
+        print("  (expanded universe: different test set, so no head-to-head with the")
+        print("   production ensemble - compare the train/test gap instead)")
+        return
+    # measure the CURRENT production ensemble on the same test set (this used
+    # to compare against a hard-coded 0.556 from an old model)
+    from model import ensemble_probs, load_ensemble
+    prod = [m.to(device) for m in load_ensemble()]
+    Xt = torch.from_numpy(Xte)
+    with torch.no_grad():
+        pp = torch.cat([ensemble_probs(prod, Xt[i:i + 4096].to(device)).cpu()
+                        for i in range(0, len(Xt), 4096)]).numpy()
+    prod_acc = float(((pp > 0.5) == (yte > 0.5)).mean())
+    print(f"  production small ensemble test acc: {prod_acc:.3f}")
+    verdict = ("LOST to" if te_acc < prod_acc - 0.002 else
+               "BEAT" if te_acc > prod_acc + 0.002 else "matched")
+    print(f"  => bigger brain {verdict} the tiny one out-of-sample")
 
 
 if __name__ == "__main__":

@@ -42,13 +42,15 @@ def backtest_pair(a, b, cost):
         return None
     n = len(df)
     i_split = int(n * 0.6)
-    train, test = df.iloc[:i_split], df.iloc[i_split:]
+    train = df.iloc[:i_split]
 
     # cointegration on TRAIN only
     _, pval, _ = coint(train["a"], train["b"])
     if pval > 0.05:
         return {"pval": pval, "trades": 0, "reason": "not cointegrated"}
     beta = np.polyfit(train["b"], train["a"], 1)[0]
+    if beta <= 0:   # the live bot skips negative-beta pairs - measure what is traded
+        return {"pval": pval, "trades": 0, "reason": "negative beta (not traded live)"}
 
     spread = df["a"] - beta * df["b"]
     mu = spread.rolling(Z_WIN).mean()
@@ -58,23 +60,21 @@ def backtest_pair(a, b, cost):
     sp_test = spread.iloc[i_split:]
 
     # trade the spread out-of-sample
-    pos, entry_sp, rets = 0, 0.0, []
+    pos, entry_sp, notional, rets = 0, 0.0, 1.0, []
     for t in range(1, len(z_test)):
         zt = z_test.iloc[t]
         if pos == 0 and np.isfinite(zt):
-            if zt > ENTRY_Z:
-                pos, entry_sp = -1, sp_test.iloc[t]      # short spread
-            elif zt < -ENTRY_Z:
-                pos, entry_sp = 1, sp_test.iloc[t]       # long spread
+            if abs(zt) > ENTRY_Z:
+                pos, entry_sp = (-1 if zt > 0 else 1), sp_test.iloc[t]   # short / long spread
+                # capital committed, measured at ENTRY; abs(beta) so a negative
+                # hedge ratio can't make the notional negative and flip P&L signs
+                notional = abs(df["a"].iloc[i_split + t]) + \
+                    abs(beta) * abs(df["b"].iloc[i_split + t])
         elif pos != 0:
             exit_now = abs(zt) < EXIT_Z or abs(zt) > STOP_Z
             if exit_now:
-                pnl = pos * (sp_test.iloc[t] - entry_sp) / abs(entry_sp
-                       if entry_sp != 0 else 1)
-                # normalize by the notional (~2x leg price); charge 2-leg cost
+                # normalize by the entry notional; charge 2-leg cost
                 gross = pos * (sp_test.iloc[t] - entry_sp)
-                notional = abs(df["a"].iloc[i_split + t]) + \
-                    beta * abs(df["b"].iloc[i_split + t])
                 rets.append(gross / notional - cost)
                 pos = 0
     rets = np.array(rets)

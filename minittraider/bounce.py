@@ -120,7 +120,8 @@ def decide_bounce(symbol: str, df: pd.DataFrame,
     last, prev = df.iloc[-1], df.iloc[-2]
     if at_support:
         action, zone, strength = "long", sup[0], sup[1]
-        rejected = last["close"] > last["open"] or min(last["low"], prev["low"]) <= zone + 0.2 * a
+        # rejection = price probed the zone AND the last candle closed back up
+        rejected = last["close"] > last["open"] and min(last["low"], prev["low"]) <= zone + 0.2 * a
         tape_against = tape is not None and tape < -0.4
         stop = zone - 0.6 * a
         target = (res[0] - 0.2 * a) if res else price + 3.0 * a
@@ -129,7 +130,7 @@ def decide_bounce(symbol: str, df: pd.DataFrame,
         side_note = f"support zone {fmt_price(zone)} (strength {strength:.0f})"
     else:
         action, zone, strength = "short", res[0], res[1]
-        rejected = last["close"] < last["open"] or max(last["high"], prev["high"]) >= zone - 0.2 * a
+        rejected = last["close"] < last["open"] and max(last["high"], prev["high"]) >= zone - 0.2 * a
         tape_against = tape is not None and tape > 0.4
         stop = zone + 0.6 * a
         target = (sup[0] + 0.2 * a) if sup else price - 3.0 * a

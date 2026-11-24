@@ -28,6 +28,10 @@ from brain import decide, fmt_price
 from cognitive import decide_cognitive, record_result
 from data import get_candles, fetch_micro, order_book_walls, tape_imbalance
 from portfolio import Portfolio
+from logger import get_daily_log_file, setup_logger
+
+setup_logger(level=config.LOG_LEVEL, log_file=get_daily_log_file() if config.LOG_TO_FILE else None)
+import swing_live
 
 # ---------------------------------------------------------------- theme
 
@@ -52,6 +56,15 @@ WATCHLIST: list[tuple[str, bool]] = (
 
 # ---------------------------------------------------------------- worker
 
+def _age(minutes: float) -> str:
+    """Position age that stays readable for multi-day swing trades."""
+    if minutes >= 1440:
+        return f"{minutes / 1440:.1f}d"
+    if minutes >= 60:
+        return f"{minutes / 60:.1f}h"
+    return f"{minutes:.1f}m"
+
+
 class Scanner(threading.Thread):
     """Background thread: fetches data, runs the brain, trades the paper account."""
 
@@ -61,20 +74,36 @@ class Scanner(threading.Thread):
         self.portfolio = Portfolio()
         self.running = threading.Event()
         self.stop_flag = threading.Event()
+        self.lock = threading.Lock()   # held for a whole scan
+        self.reset_requested = threading.Event()   # handled by THIS thread between scans
 
     def log(self, text: str, tag: str = "info") -> None:
         self.out.put(("log", datetime.now().strftime("%H:%M:%S"), text, tag))
 
+    def _do_reset(self) -> None:
+        import os
+        from portfolio import STATE_FILE
+        with self.lock:
+            if os.path.exists(STATE_FILE):
+                os.remove(STATE_FILE)
+            self.portfolio = Portfolio()
+        self.reset_requested.clear()
+        self.log(f"account reset to ${config.STARTING_CASH:,.0f}")
+
     def run(self) -> None:
         while not self.stop_flag.is_set():
+            if self.reset_requested.is_set():
+                self._do_reset()
             if self.running.is_set():
                 try:
-                    self.scan()
+                    with self.lock:
+                        self.scan()
                 except Exception as e:
                     self.log(f"scan failed: {e}", "bad")
             # sleep in small steps so pause/quit reacts quickly
             for _ in range(config.SCAN_INTERVAL_SECONDS * 4):
-                if self.stop_flag.is_set() or not self.running.is_set():
+                if self.stop_flag.is_set() or not self.running.is_set() \
+                        or self.reset_requested.is_set():
                     break
                 time.sleep(0.25)
             if not self.running.is_set():
@@ -86,8 +115,14 @@ class Scanner(threading.Thread):
         reasons: dict[str, str] = {}
         dfs: dict = {}
         p = self.portfolio
+        swing_mode = config.STRATEGY == config.Strategy.SWING
+        if swing_mode:
+            swing_live.prefetch([s for s, c in WATCHLIST if c or not config.SWING_CRYPTO_ONLY])
 
         for symbol, is_crypto in WATCHLIST:
+            if swing_mode and config.SWING_CRYPTO_ONLY and not is_crypto and symbol not in p.positions:
+                rows.append((symbol, "-", "-", "-", "skipped (swing trades crypto only)"))
+                continue
             try:
                 df = get_candles(symbol, is_crypto)
             except Exception as e:
@@ -98,6 +133,9 @@ class Scanner(threading.Thread):
             stale = df is None or df.empty or (
                 (time.time() - df.index[-1].timestamp()) / 60 > config.STALE_DATA_MINUTES
             )
+            if stale and symbol in p.positions and p.positions[symbol].exit_state:
+                rows.append((symbol, "-", "-", "-", "no fresh data - holding swing position"))
+                continue
             if stale:
                 if symbol in p.positions:
                     price = float(df["close"].iloc[-1]) if df is not None and not df.empty \
@@ -111,7 +149,34 @@ class Scanner(threading.Thread):
             price = float(df["close"].iloc[-1])
             prices[symbol] = price
 
-            if symbol in p.positions:
+            if symbol in p.positions and p.positions[symbol].exit_state:
+                pos = p.positions[symbol]
+                try:
+                    bars = swing_live.closed_bars(symbol, is_crypto)
+                except Exception:
+                    bars = None
+                why, pos.exit_state, fill = swing_live.manage(pos.exit_state, bars, price)
+                if fill is not None and p.check_liquidation(symbol, fill):
+                    why = "LIQUIDATED (gapped through the stop and the liquidation level)"
+                elif fill is None and p.check_liquidation(symbol, price):  # an earlier stop fill wins
+                    why, fill = "LIQUIDATED (price hit the liquidation level)", None
+                p.save()
+                if why:
+                    exit_px = fill if fill is not None else price
+                    pnl = p.close(symbol, exit_px, why)
+                    record_result(pnl)
+                    self.log(f"CLOSE {pos.side} {symbol} @ {fmt_price(exit_px)} -> {pnl:+.2f} ({why})",
+                             "good" if pnl >= 0 else "bad")
+                    # like trader.py: no re-entry in the same scan (it would act on a
+                    # signal bar from while we were still in the trade)
+                    rows.append((symbol, fmt_price(price), "-", "-", f"CLOSED {pos.side} - {why}"[:70]))
+                    continue
+                else:
+                    note = swing_live.describe(pos.exit_state, price)
+                    reasons[symbol] = f"holding {pos.side} {symbol}: {note}"
+                    rows.append((symbol, fmt_price(price), "-", "-", f"HOLD {pos.side} - {note}"[:70]))
+                    continue
+            elif symbol in p.positions:
                 why = p.check_exit(symbol, price)
                 if why:
                     side = p.positions[symbol].side
@@ -120,13 +185,30 @@ class Scanner(threading.Thread):
                     self.log(f"CLOSE {side} {symbol} @ {fmt_price(price)} -> {pnl:+.2f} ({why})",
                              "good" if pnl >= 0 else "bad")
 
-            if config.STRATEGY == "cognitive":
+            exit_state = None
+            if config.STRATEGY == config.Strategy.SWING:
+                if config.SWING_CRYPTO_ONLY and not is_crypto:
+                    rows.append((symbol, fmt_price(price), "-", "-", "skipped (swing trades crypto only)"))
+                    continue
+                try:
+                    bars = swing_live.closed_bars(symbol, is_crypto)
+                except Exception as e:
+                    rows.append((symbol, fmt_price(price), "-", "-", f"daily bars unavailable: {e}"[:70]))
+                    continue
+                decision = swing_live.decide_swing(symbol, bars)
+                decision.price = price
+                if decision.action != "none" and p.can_open(symbol):
+                    exit_state = swing_live.new_exit_state(symbol, decision.action, price,
+                                                           decision.atr, bars)
+                    decision.sl = exit_state["stop"]
+                max_hold = 0
+            elif config.STRATEGY == config.Strategy.COGNITIVE:
                 walls = order_book_walls(symbol) if is_crypto else None
                 tape = tape_imbalance(symbol) if is_crypto else None
                 decision = decide_cognitive(symbol, df, walls, tape,
                                             equity=p.equity(prices))
                 max_hold = config.COGNITIVE_MAX_HOLD_MINUTES
-            elif config.STRATEGY == "bounce":
+            elif config.STRATEGY == config.Strategy.BOUNCE:
                 walls = order_book_walls(symbol) if is_crypto else None
                 tape = tape_imbalance(symbol) if is_crypto else None
                 decision = decide_bounce(symbol, df, walls, tape)
@@ -142,11 +224,15 @@ class Scanner(threading.Thread):
             if decision.action != "none" and p.can_open(symbol):
                 pos = p.open(symbol, decision.action, decision.price,
                              decision.atr, decision.confidence, decision.reasons[-1],
-                             tp=decision.tp, sl=decision.sl, max_hold=max_hold)
+                             tp=decision.tp, sl=decision.sl, max_hold=max_hold,
+                             exit_state=exit_state)
                 if pos:
+                    if exit_state is not None:
+                        swing_live.mark_acted(symbol, bars)   # only once it really opened
+                    tp_txt = "dynamic" if pos.exit_state else fmt_price(pos.take_profit)
                     self.log(f"OPEN {pos.side.upper()} {symbol} @ {fmt_price(price)} "
                              f"(confidence {decision.confidence:.0%}) "
-                             f"tp {fmt_price(pos.take_profit)} sl {fmt_price(pos.stop_loss)}", "trade")
+                             f"tp {tp_txt} sl {fmt_price(pos.stop_loss)}", "trade")
                     self.log("  " + decision.reasons[-1], "dim")
 
             verdict = decision.action.upper() if decision.action != "none" else "wait"
@@ -158,7 +244,9 @@ class Scanner(threading.Thread):
             (pos.symbol, pos.side, f"{pos.qty:.6f}", f"{fmt_price(pos.entry)}",
              f"{fmt_price(prices.get(sym, pos.entry))}",
              pos.pnl(prices.get(sym, pos.entry)),
-             f"{pos.age_minutes():.1f}m", f"{fmt_price(pos.take_profit)}", f"{fmt_price(pos.stop_loss)}")
+             _age(pos.age_minutes()),
+             "dynamic" if pos.exit_state else f"{fmt_price(pos.take_profit)}",
+             f"{fmt_price(pos.exit_state['stop'] if pos.exit_state else pos.stop_loss)}")
             for sym, pos in p.positions.items()
         ]
         total = p.wins + p.losses
@@ -302,17 +390,11 @@ class App:
             self.status.configure(text=f"scanning every {config.SCAN_INTERVAL_SECONDS}s", fg=GREEN)
 
     def _reset(self) -> None:
-        import os
-        from portfolio import STATE_FILE
-        was_running = self.scanner.running.is_set()
-        self.scanner.running.clear()
-        if os.path.exists(STATE_FILE):
-            os.remove(STATE_FILE)
-        self.scanner.portfolio = Portfolio()
+        # The scanner thread performs the reset between scans: taking its lock
+        # here (UI thread) froze the window until a slow scan finished.
+        self.scanner.reset_requested.set()
         self._log_line(datetime.now().strftime("%H:%M:%S"),
-                       f"account reset to ${config.STARTING_CASH:,.0f}", "info")
-        if was_running:
-            self.scanner.running.set()
+                       "reset requested - applying after the current scan", "info")
 
     def _show_reasoning(self, _event=None) -> None:
         sel = self.watch.selection()

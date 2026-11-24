@@ -13,7 +13,6 @@ import sys
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
-import pandas as pd
 
 sys.path.insert(0, __file__.rsplit("hft_rl", 1)[0])
 from alpaca.data.requests import StockBarsRequest          # noqa: E402
@@ -60,10 +59,16 @@ def main():
           f"(train {sum(len(f) for f in train_frames)} / "
           f"test {sum(len(f) for f in test_frames)} bars)")
 
+    # feature scaling from TRAINING data only, shared by every env
+    import pandas as pd
+    from hft_rl.env import FEATURES
+    tr_all = pd.concat(train_frames)[FEATURES].to_numpy(np.float32)
+    norm = (tr_all.mean(0), tr_all.std(0))
+
     agent = DQNAgent(STATE_DIM, N_ACTIONS)
     step = 0
     for ep in range(episodes):
-        env = ScalperEnv(train_frames[ep % len(train_frames)], ctx=ctx, seed=ep)
+        env = ScalperEnv(train_frames[ep % len(train_frames)], ctx=ctx, seed=ep, norm=norm)
         s = env.reset()
         done = False
         while not done:
@@ -81,7 +86,7 @@ def main():
     agent.eps = 0.0
     actions, rewards_when_traded = [], []
     for fr in test_frames:
-        env = ScalperEnv(fr, ctx=ctx, seed=999)
+        env = ScalperEnv(fr, ctx=ctx, seed=999, norm=norm)
         s = env.reset()
         done = False
         while not done:

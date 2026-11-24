@@ -22,7 +22,9 @@ from __future__ import annotations
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
+import pandas as pd
 import torch
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, QueryOrderStatus, TimeInForce
@@ -30,6 +32,7 @@ from alpaca.trading.requests import (GetOrdersRequest, LimitOrderRequest,
                                      ReplaceOrderRequest, StopLossRequest,
                                      TakeProfitRequest)
 
+import botstate
 import config
 from data import FEATURE_COLUMNS, _client, compute_features, download_bars
 from manipulation import bar_flags
@@ -93,17 +96,18 @@ def scan(models, scaler):
     regime_wins = {s: 0 for s in STRATEGY_NAMES}
     regime_n = {s: 0 for s in STRATEGY_NAMES}
     regime_sumsq = {s: 0.0 for s in STRATEGY_NAMES}   # for mean/std gate
-    lookback_bars = config.REGIME_LOOKBACK_DAYS * 7
-    fast_bars = config.REGIME_LOOKBACK_FAST_DAYS * 7
+    # CALENDAR-day windows, exactly as walkforward.py validated them (this
+    # used to be N*7 hourly bars = N TRADING days, ~40% longer than tested)
+    now_ts = pd.Timestamp.now(tz="America/New_York")
+    slow_start = now_ts - pd.Timedelta(days=config.REGIME_LOOKBACK_DAYS)
+    fast_start = now_ts - pd.Timedelta(days=config.REGIME_LOOKBACK_FAST_DAYS)
     for ticker in config.TICKERS:
         try:
             df = download_bars(ticker, days=config.LIVE_LOOKBACK_DAYS)
             feats = compute_features(df)
             if len(feats) < config.SEQ_LEN:
                 continue
-            recent = feats.tail(lookback_bars)
-            fast_start = (recent.index[-fast_bars] if len(recent) >= fast_bars
-                          else recent.index[0])
+            recent = feats[feats.index >= slow_start]
             for name in STRATEGY_NAMES:
                 # Gate on TRAILING-stop returns — the exit the bot actually
                 # trades — not the fixed bracket. Raw-sum dual-window rule
@@ -182,8 +186,27 @@ def cancel_stale_entries(client: TradingClient, pending: list[str]) -> None:
 
 
 # Per-position trailing state (trail distance in $, high-water mark). Keyed
-# by symbol; reconstructed from the live stop order after a restart.
-_trail: dict[str, dict] = {}
+# by symbol; persisted to stock_trail.json so a restart keeps the real trail.
+_trail: dict[str, dict] = botstate.load(botstate.STOCK_TRAIL, {})
+
+
+def _stop_orders(open_orders) -> dict:
+    """Stop orders by symbol. With nested=True, a bracket's stop LEG lives inside
+    its parent's `legs`, not in the top-level list - look in both places."""
+    stops = {}
+    for o in open_orders:
+        for leg in [o] + list(getattr(o, "legs", None) or []):
+            status = str(getattr(leg.status, "value", leg.status))
+            # allow-list of LIVE statuses (replaced / expired / pending_cancel
+            # legs can appear too - trailing one of those fails silently)
+            if leg.type is not None and str(leg.type.value) in ("stop", "stop_limit") \
+                    and status in ("new", "accepted", "held", "pending_new"):
+                prev = stops.get(leg.symbol)
+                prev_status = str(getattr(prev.status, "value", prev.status)) if prev else ""
+                if prev is None or (status in ("new", "accepted")
+                                    and prev_status not in ("new", "accepted")):
+                    stops[leg.symbol] = leg
+    return stops
 
 
 def trail_stops(client: TradingClient, positions) -> None:
@@ -197,8 +220,7 @@ def trail_stops(client: TradingClient, positions) -> None:
             status=QueryOrderStatus.OPEN, nested=True))
     except Exception:
         return
-    stops = {o.symbol: o for o in open_orders
-             if o.type is not None and str(o.type.value) == "stop"}
+    stops = _stop_orders(open_orders)
     live_syms = {p.symbol for p in positions}
     for sym in list(_trail):
         if sym not in live_syms:
@@ -212,9 +234,17 @@ def trail_stops(client: TradingClient, positions) -> None:
         price = float(p.current_price)
         long_pos = float(p.qty) > 0
         st = _trail.get(p.symbol)
-        if st is None:  # reconstruct trail distance from the current stop
-            st = {"dist": abs(entry - stop) * config.TRAIL_ATR_MULT
-                  / config.SL_ATR_MULT, "hwm": price}
+        if st is None:
+            # No saved state (e.g. file deleted). If the stop is still on the
+            # losing side of entry it's the original stop, so the initial
+            # distance can be rebuilt. If it has already trailed past entry,
+            # "entry - stop" no longer means anything (it can be ~0, which would
+            # set the stop AT the price and sell immediately) - keep the
+            # current gap between price and stop instead.
+            still_initial = stop < entry if long_pos else stop > entry
+            dist = (abs(entry - stop) * config.TRAIL_ATR_MULT / config.SL_ATR_MULT
+                    if still_initial else abs(price - stop))
+            st = {"dist": max(dist, 0.01), "hwm": price}
             _trail[p.symbol] = st
         st["hwm"] = max(st["hwm"], price) if long_pos else min(st["hwm"], price)
         new_stop = (st["hwm"] - st["dist"] if long_pos
@@ -227,6 +257,7 @@ def trail_stops(client: TradingClient, positions) -> None:
                 print(f"  {p.symbol}: trailing stop -> {new_stop:.2f}")
             except Exception as e:
                 print(f"  {p.symbol}: trail update failed: {e}")
+    botstate.save(botstate.STOCK_TRAIL, _trail)
 
 
 def explain_trade(c: dict, imb: float | None, equity: float,
@@ -268,9 +299,20 @@ def rebalance(client: TradingClient, models, scaler,
     buying_power = float(account.buying_power)   # day-trade margin (~4x)
     positions = client.get_all_positions()
     trail_stops(client, positions)
-    held = {p.symbol for p in positions}
+    try:
+        pairs_legs = botstate.pairs_leg_symbols()
+    except botstate.StateUnavailable as e:
+        print(f"  pairs state unreadable ({e}) - no new entries this scan")
+        return
+    # the stock bot's own positions: not the pairs bot's legs, not the crypto
+    # bot's coins (BTCUSD...) - those used to eat stock slots / sector caps
+    own_held = {p.symbol for p in positions
+                if not p.symbol.endswith("USD")} - pairs_legs
+    held = {p.symbol for p in positions} | pairs_legs   # never enter these
     sector_count: dict[str, int] = {}
     for p in positions:
+        if p.symbol not in own_held:
+            continue          # pairs-bot legs don't count toward the stock bot's sector caps
         sec = config.SECTOR.get(p.symbol, "other")
         sector_count[sec] = sector_count.get(sec, 0) + 1
 
@@ -308,7 +350,7 @@ def rebalance(client: TradingClient, models, scaler,
     # Leverage = more concurrent positions (diversified), capped by
     # available buying power below.
     max_positions = int(round(config.MAX_POSITIONS * config.LEVERAGE))
-    slots = max(0, max_positions - len(held))
+    slots = max(0, max_positions - len(own_held))   # pairs legs don't use stock-bot slots
     entered = 0
     for c in candidates:
         if entered >= slots:
@@ -367,6 +409,7 @@ def rebalance(client: TradingClient, models, scaler,
             pending.append(str(order.id))
             _trail[c["ticker"]] = {"dist": config.TRAIL_ATR_MULT * atr * price,
                                    "hwm": price}
+            botstate.save(botstate.STOCK_TRAIL, _trail)
             sector_count[sec] = sector_count.get(sec, 0) + 1
             entered += 1
             imb_str = f"{imb:.2f}" if imb is not None else "n/a"
@@ -379,15 +422,35 @@ def rebalance(client: TradingClient, models, scaler,
         print("  no new entries")
 
 
-def flatten_all(client: TradingClient):
+def flatten_all(client: TradingClient, fallback: bool = False) -> bool:
+    """Close the stock bot's own positions. Returns False if it couldn't tell
+    which positions belong to the pairs bot (caller retries shortly).
+    fallback=True (after repeated failures): close only the positions that are
+    DEFINITELY the stock bot's - the ones it holds trailing-stop state for -
+    so it never ends up holding overnight because a state file is unreadable."""
     # STOCK-ONLY: the account may be shared with the crypto bot, so never
     # close crypto positions (symbols like "BTCUSD") or cancel crypto orders
     # (symbols like "BTC/USD"). Only touch this bot's own stock symbols.
+    # Also never touch the PAIRS bot's legs: it holds market-neutral pairs
+    # overnight on this same account; closing one leg leaves a naked bet.
     print("  flattening stock positions")
+    own_only = None
+    try:
+        pairs_legs = botstate.pairs_leg_symbols()
+    except botstate.StateUnavailable as e:
+        if not fallback:
+            # don't guess: an empty set here would close the pairs bot's legs
+            print(f"  pairs state unreadable ({e}) - retrying the flatten shortly")
+            return False
+        own_only = set(_trail)
+        pairs_legs = set()
+        print(f"  !!! WARNING: pairs state still unreadable ({e}) - closing ONLY the stock "
+              f"bot's own tracked positions {sorted(own_only)}; check pairs_state.json !!!")
     try:
         for o in client.get_orders(GetOrdersRequest(
                 status=QueryOrderStatus.OPEN, limit=200)):
-            if "/" not in o.symbol:          # stock order
+            if "/" not in o.symbol and o.symbol not in pairs_legs \
+                    and (own_only is None or o.symbol in own_only):   # our stock order
                 client.cancel_order_by_id(o.id)
     except Exception as e:
         print(f"  order cancel error: {e}")
@@ -395,8 +458,10 @@ def flatten_all(client: TradingClient):
     for attempt in range(3):
         stuck = []
         for p in client.get_all_positions():
-            if p.symbol.endswith("USD"):      # crypto position -> skip
+            if p.symbol.endswith("USD") or p.symbol in pairs_legs:  # crypto / pairs -> skip
                 continue
+            if own_only is not None and p.symbol not in own_only:
+                continue          # fallback: only what's definitely ours
             try:
                 client.close_position(p.symbol)
             except Exception as e:
@@ -405,6 +470,7 @@ def flatten_all(client: TradingClient):
         if not stuck:
             break
         time.sleep(2)
+    return True
 
 
 def daily_loss_hit(client: TradingClient) -> bool:
@@ -453,22 +519,33 @@ def main():
 
     pending: list[str] = []
     halted_until_close = False
+    flatten_fails = 0
     while True:
       try:
         clock = client.get_clock()
         now = datetime.now(timezone.utc)
         if clock.is_open:
             secs_to_close = (clock.next_close - now).total_seconds()
-            secs_since_open = 6.5 * 3600 - secs_to_close
+            et_now = now.astimezone(ZoneInfo("America/New_York"))
+            session_open = et_now.replace(hour=9, minute=30, second=0, microsecond=0)
+            secs_since_open = (et_now - session_open).total_seconds()
             if halted_until_close or daily_loss_hit(client):
                 if not halted_until_close:
-                    flatten_all(client)
+                    flatten_fails += 1
+                    if not flatten_all(client, fallback=flatten_fails >= 3):
+                        time.sleep(30)
+                        continue
+                    flatten_fails = 0
                     halted_until_close = True
                 if once:
                     return
                 sleep_s = secs_to_close + 120
             elif secs_to_close <= FLATTEN_MINUTES_BEFORE_CLOSE * 60:
-                flatten_all(client)
+                flatten_fails += 1
+                if not flatten_all(client, fallback=flatten_fails >= 3):
+                    time.sleep(30)          # state file busy: try again, don't skip to the close
+                    continue
+                flatten_fails = 0
                 if once:
                     return
                 sleep_s = secs_to_close + 120

@@ -19,7 +19,6 @@ import os
 import random
 import time
 
-import numpy as np
 import pandas as pd
 
 from backtest import CACHE_DIR, FEES, get_history

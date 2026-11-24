@@ -90,10 +90,13 @@ MARKET_FILTER = False
 BREAKEVEN_AT_R = 1.0
 
 # Manipulation defense: skip breakout-family entries whose entry bar shows
-# the fake-breakout signature (walk-forward: those trades averaged −13.6 bps
-# vs +0.5 clean). Stop-hunt bars are NOT filtered — they trade better, not
-# worse (a reclaimed level is a reversal, not a trap).
-FAKE_BREAKOUT_FILTER = True
+# the fake-breakout signature. OFF since Nov 2026: the old "-13.6 bps" result
+# came from a detector that peeked at the NEXT bar (it called a breakout fake
+# because the following bar failed). With the causal detector
+# (measure_fake_breakout.py, 63k signals, 5y, same-day trailing exits) flagged
+# trades averaged +12.4 bps vs -2.3 unflagged (t=+3.2; final session-capped labels)
+# - the filter was skipping the BETTER trades.
+FAKE_BREAKOUT_FILTER = False
 BREAKOUT_FAMILY = ["breakout", "orb", "disc_orb_wide", "breakdown", "orb_dn"]
 
 # Order-book overlay: skip an entry when the live top-of-book is stacked

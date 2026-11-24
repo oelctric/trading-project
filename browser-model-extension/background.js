@@ -116,6 +116,21 @@ const TOOLS = [
   {
     type: "function",
     function: {
+      name: "drag",
+      description: "Drag element 'from' and drop it onto element 'to' (both are element indices from get_page). Use for drag-and-drop lists, sliders, sortable items and drop zones.",
+      parameters: {
+        type: "object",
+        properties: {
+          from: { type: "integer", description: "Index of the element to drag" },
+          to: { type: "integer", description: "Index of the element to drop onto" }
+        },
+        required: ["from", "to"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
       name: "navigate",
       description: "Navigate the active tab to a URL.",
       parameters: {
@@ -225,7 +240,7 @@ function coerceArgs(a) {
   return a;
 }
 
-const KNOWN_TOOLS = ["get_page", "get_editor", "set_editor_content", "editor_debug", "upload_file", "click_at", "click", "type", "navigate", "scroll", "screenshot", "done"];
+const KNOWN_TOOLS = ["get_page", "get_editor", "set_editor_content", "editor_debug", "upload_file", "click_at", "click", "type", "select_option", "drag", "navigate", "scroll", "screenshot", "done"];
 
 // Dangerous button text patterns that deserve extra caution. If the model is about
 // to click an element whose label matches one of these, log a visible warning so
@@ -245,14 +260,17 @@ const waitUntilStable = async (tabId) => {
     const listener = (id, info) => { if (!done && id === tabId && info.status === "complete") cleanup(); };
     const cleanup = () => { if (done) return; done = true; clearTimeout(timer); chrome.tabs.onUpdated.removeListener(listener); resolve(); };
     const timer = setTimeout(cleanup, alreadyComplete ? 2000 : 6000);
-    // Fire immediately if tab is already loaded to avoid relying only on timeout.
-    if (alreadyComplete) cleanup();
-    else chrome.tabs.onUpdated.addListener(listener);
+    // An already-"complete" tab (single-page apps) gets no load event: don't
+    // resolve at once (that skipped the DOM-quiet check and the next read saw a
+    // stale page) - let the quiet poller decide, capped at 2s by the timer.
+    if (!alreadyComplete) chrome.tabs.onUpdated.addListener(listener);
   });
 
+  let finished = false;   // stops the poller once the race is decided (it used to poll forever)
   const quietDone = new Promise((resolve) => {
-    let lastLen = -1, unchanged = 0;
+    let lastLen = -1, unchanged = 0, polls = 0;
     const check = () => {
+      if (finished || ++polls > 120) { resolve(); return; }
       chrome.tabs.get(tabId).then(async (t) => {
         if (!t || t.status === "loading") { setTimeout(check, 250); return; }
         try {
@@ -261,13 +279,14 @@ const waitUntilStable = async (tabId) => {
           if (result !== lastLen) { unchanged = 0; } else { unchanged++; }
           lastLen = result;
         } catch (e) { unchanged++; }
-        if (unchanged >= 3 || unchanged > 10) resolve(); else setTimeout(check, 180);
+        if (unchanged >= 3) resolve(); else setTimeout(check, 180);
       }).catch(() => resolve());
     };
     check();
   });
 
   await Promise.race([loadDone, quietDone]);
+  finished = true;
 };
 
 // Some (esp. smaller) models emit tool calls as PLAIN TEXT instead of using the
@@ -298,7 +317,7 @@ function parseTextToolCall(content) {
   }
 
   // Function-call form: name(...) with JSON or positional args
-  const fm = s.match(/\b(get_page|get_editor|set_editor_content|editor_debug|upload_file|click_at|click|type|select_option|navigate|scroll|screenshot|done)\s*\(([\s\S]*?)\)/i);
+  const fm = s.match(/\b(get_page|get_editor|set_editor_content|editor_debug|upload_file|click_at|click|type|select_option|drag|navigate|scroll|screenshot|done)\s*\(([\s\S]*?)\)/i);
   if (fm) {
     const name = fm[1].toLowerCase();
     const inner = fm[2].trim();
@@ -311,6 +330,7 @@ function parseTextToolCall(content) {
         if (name === "scroll") args = { direction: parts[0] };
         else if (name === "click") args = { index: parts[0] };
         else if (name === "click_at") args = { x: parts[0], y: parts[1] };
+        else if (name === "drag") args = { from: parts[0], to: parts[1] };
         else if (name === "type") args = { index: parts[0], text: parts.slice(1).join(", ") };
         else if (name === "select_option") args = { index: parts[0], value: parts.slice(1).join(", ") };
         else if (name === "set_editor_content") args = { content: parts.join(", ") };
@@ -330,7 +350,21 @@ function parseTextToolCall(content) {
   return null;
 }
 
-let stopRequested = false;
+// Run ownership: every Run / Stop / New chat bumps `currentRun`. A run only
+// proceeds while the ticket it was given is still current, so a Stop that
+// arrives at ANY time (even while the run is queued) cancels it for good.
+let currentRun = 0;
+let runChain = Promise.resolve();   // runs are strictly queued on this chain
+let modelAbort = null;              // aborts the in-flight model request on Stop
+const cancelReasons = {};           // run ticket -> why it was cancelled (first reason wins)
+function cancelRuns(reason = "stop") {
+  if (!(currentRun in cancelReasons)) cancelReasons[currentRun] = reason;
+  // runs that never reach stopMsg (e.g. a queued run that bails early) would
+  // leave entries behind: keep only recent tickets
+  for (const k of Object.keys(cancelReasons)) if (+k < currentRun - 20) delete cancelReasons[k];
+  currentRun++;
+  if (modelAbort) { try { modelAbort.abort(); } catch (e) {} }
+}
 
 const activeTab = async () => {
   const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
@@ -1318,6 +1352,8 @@ async function callModel(cfg, messages, onChunk) {
     stream: true
   });
 
+  const controller = new AbortController();
+  modelAbort = controller;
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
       const resp = await fetch(base + "/chat/completions", {
@@ -1326,7 +1362,8 @@ async function callModel(cfg, messages, onChunk) {
           "Content-Type": "application/json",
           ...(cfg.apiKey ? { Authorization: "Bearer " + cfg.apiKey } : {})
         },
-        body
+        body,
+        signal: controller.signal
       });
       if (!resp.ok) {
         const errBody = await resp.text().catch(() => "");
@@ -1336,6 +1373,7 @@ async function callModel(cfg, messages, onChunk) {
       }
       return await streamResponse(resp, onChunk);
     } catch (e) {
+      if (controller.signal.aborted) throw new Error("aborted by user");
       if (attempt < MAX_RETRIES && /retryable|503|502|504|timeout/i.test(String(e))) {
         // Log but continue; caller gets the final result.
         await sleep(RETRY_DELAY_MS * (1 << attempt));
@@ -1411,25 +1449,42 @@ function saveTranscript() {
     });
   }, 80);
 }
-let lastThinkIndex = null; // used to update streaming think output in-place
+let lastThinkIndex = null; // the live "think" line of the CURRENT model call
 
-function log(_port, kind, text) {
+function log(_port, kind, text, run) {
+  if (run !== undefined && run !== currentRun) return;   // a cancelled run can't write into a new chat
   transcript.push({ kind, text });
-  if (transcript.length > 400) transcript = transcript.slice(-400);
+  if (transcript.length > 400) {
+    const drop = transcript.length - 400;
+    transcript = transcript.slice(drop);
+    if (lastThinkIndex != null) lastThinkIndex = lastThinkIndex >= drop ? lastThinkIndex - drop : null;
+  }
   saveTranscript();
 }
-// Append only new deltas to the last "think" entry (for streaming updates without duplicates).
-function logThinkAppend(newText) {
-  const trimmed = newText.trim();
+function beginThinkStream() { lastThinkIndex = null; }
+// onChunk passes the FULL text streamed so far, so REPLACE the line's text.
+// (It used to append the cumulative text on every chunk: "a", "a ab", ...)
+function logThinkAppend(fullText) {
+  const trimmed = fullText.trim();
   if (!trimmed) return;
   if (lastThinkIndex != null && lastThinkIndex < transcript.length) {
-    transcript[lastThinkIndex].text += " " + trimmed;
+    transcript[lastThinkIndex].text = trimmed;
     saveTranscript(); // persist streaming updates so the chat shows them live
   } else {
-    lastThinkIndex = transcript.length;
     log(null, "think", trimmed);
     lastThinkIndex = transcript.length - 1;
   }
+}
+// After the call: put the final text on the live line (or remove an empty one).
+function endThinkStream(finalText) {
+  if (lastThinkIndex != null && lastThinkIndex < transcript.length) {
+    if (finalText) transcript[lastThinkIndex].text = finalText;
+    else transcript.splice(lastThinkIndex, 1);
+    saveTranscript();
+  } else if (finalText) {
+    log(null, "think", finalText);
+  }
+  lastThinkIndex = null;
 }
 function setRunningFlag(v) { chrome.storage.local.set({ running: v }).catch(() => {}); }
 
@@ -1618,17 +1673,25 @@ function resetConversation() {
 }
 
 // Actions that should trigger a stable-wait after executing (to avoid stale reads).
-const ACTIONS_NEED_STABLE = new Set(["click", "click_at", "type", "navigate", "scroll", "select_option", "upload_file"]);
+const ACTIONS_NEED_STABLE = new Set(["click", "click_at", "type", "navigate", "scroll", "select_option", "upload_file", "drag"]);
 
-async function runAgent(cfg, task, port) {
-  stopRequested = false;
+async function runAgent(cfg, task, port, myRun) {
+  const stopped = () => myRun !== currentRun;
+  const stopMsg = () => {   // say why THIS run stopped (it used to always claim "Stopped by user.")
+    const why = cancelReasons[myRun] || "stop";
+    delete cancelReasons[myRun];   // read once; the map must not grow forever
+    if (why === "stop") log(port, "error", "Stopped by user.");
+    else if (why === "superseded") log(port, "result", "Previous task replaced by your new message.");
+  };
+  const logRun = (kind, text) => log(port, kind, text, myRun);
+  if (stopped()) return;
   await ready;
   startKeepAlive(); // help prevent Chrome from killing the SW mid-run
 
   // LOCK ON TO THE ACTIVE TAB — we operate on THIS tab for the entire run.
   // Switching tabs mid-task is now safe (the agent keeps working in the original).
   const workTab = await activeTab();
-  if (!workTab) { log(port, "error", "No active tab."); return; }
+  if (!workTab) { logRun("error", "No active tab."); return; }
   let attached = false;
 
   // High-realism mode: attach debugger. If DevTools is open on this tab, fall back gracefully.
@@ -1636,10 +1699,10 @@ async function runAgent(cfg, task, port) {
     try {
       await attachDebugger(workTab.id);
       attached = true;
-      log(port, "result", "High-realism input ON (debugger attached — banner is expected).");
+      logRun("result", "High-realism input ON (debugger attached — banner is expected).");
     } catch (e) {
       cfg.trusted = false;
-      log(port, "error", "Could not enable high-realism input (" + e.message + "). Close DevTools for this tab if open. Falling back to standard input.");
+      logRun("error", "Could not enable high-realism input (" + e.message + "). Close DevTools for this tab if open. Falling back to standard input.");
     }
   }
 
@@ -1649,7 +1712,7 @@ async function runAgent(cfg, task, port) {
   if (!conversation) resetConversation();
   conversation.push({ role: "user", content: task });
   saveConversation();
-  log(port, "user", task);
+  logRun("user", task);
   const messages = conversation;
 
   const recentSigs = [];
@@ -1668,19 +1731,21 @@ async function runAgent(cfg, task, port) {
 
   try {
   for (let step = 0; step < stepCap; step++) {
-    if (stopRequested) { log(port, "error", "Stopped by user."); return; }
-    if (cfg.auto && step === maxSteps) log(port, "result", `Auto mode: past ${maxSteps} steps, still working…`);
+    if (stopped()) { stopMsg(); return; }
+    if (cfg.auto && step === maxSteps) logRun("result", `Auto mode: past ${maxSteps} steps, still working…`);
 
     let msg;
     currentThinkChunk = "";
+    beginThinkStream();   // each model call gets its own live "thinking" line
     try {
       msg = await callModel(cfg, messages, onChunk);
     } catch (e) {
-      // If streaming failed with partial text, log it as a final think so the user sees progress.
-      if (currentThinkChunk.trim()) log(port, "think", currentThinkChunk.trim());
-      log(port, "error", "Model call failed: " + e.message);
+      // streaming text (if any) is already on screen in the live think line
+      if (stopped()) { stopMsg(); return; }
+      logRun("error", "Model call failed: " + e.message);
       return;
     }
+    if (stopped()) { stopMsg(); return; }
 
     messages.push(msg);
     saveConversation();
@@ -1696,17 +1761,32 @@ async function runAgent(cfg, task, port) {
       }
     }
 
-    // Final non-streaming log of the assistant's thinking (for conversation history display).
-    if (msg.content && msg.content.trim() && !parsedFromText) log(port, "think", msg.content.trim());
+    // Finalize the live think line with the complete text (instead of adding a
+    // second copy). A tool call written as text isn't "thinking" - drop it.
+    endThinkStream(msg.content && !parsedFromText ? msg.content.trim() : "");
 
     if (toolCalls.length === 0) {
-      log(port, "done", msg.content || "(model returned no tool call and no content)");
+      logRun("done", msg.content || "(model returned no tool call and no content)");
       return;
     }
 
     const answered = new Set();
     for (const tc of toolCalls) {
-      if (stopRequested) { log(port, "error", "Stopped by user."); return; }
+      if (stopped()) {
+        // Answer every tool call of this assistant turn that didn't run, or
+        // strict OpenAI-compatible servers reject the NEXT request (400: a
+        // tool_call without a tool reply) - which happened on every follow-up
+        // sent while a batch of tool calls was running.
+        for (const t of toolCalls) {
+          if (t && t.id && !answered.has(t.id)) {
+            messages.push({ role: "tool", tool_call_id: t.id, name: (t.function && t.function.name) || "unknown", content: "cancelled (task was stopped)" });
+            answered.add(t.id);
+          }
+        }
+        saveConversation();
+        stopMsg();
+        return;
+      }
       const fn = tc && tc.function;
       if (!fn || !fn.name) {
         if (tc && tc.id) { messages.push({ role: "tool", tool_call_id: tc.id, name: "unknown", content: "malformed tool call ignored" }); answered.add(tc.id); }
@@ -1726,7 +1806,7 @@ async function runAgent(cfg, task, port) {
         try {
           const loc = await sendToTab(workTab.id, { action: "locate", index: args.index });
           if (loc && loc.ok && loc.label && DANGEROUS_PATTERNS.test(loc.label)) {
-            log(port, "error", `⚠ Potentially destructive click: "${loc.label}" — watch closely and hit Stop if wrong.`);
+            logRun("error", `⚠ Potentially destructive click: "${loc.label}" — watch closely and hit Stop if wrong.`);
           }
         } catch (e) { /* ignore; continue with the action */ }
       }
@@ -1742,11 +1822,11 @@ async function runAgent(cfg, task, port) {
         }
         messages.push({ role: "assistant", content: answer });
         saveConversation();
-        log(port, "done", answer);
+        logRun("done", answer);
         return;
       }
 
-      log(port, "tool", `${name}(${JSON.stringify(args)})`);
+      logRun("tool", `${name}(${JSON.stringify(args)})`);
 
       let result;
       try {
@@ -1768,7 +1848,7 @@ async function runAgent(cfg, task, port) {
       if (imageUrl) logImage(imageUrl);
 
       const short = JSON.stringify(result);
-      log(port, "result", short.length > 500 ? short.slice(0, 500) + " …" : short);
+      logRun("result", short.length > 500 ? short.slice(0, 500) + " …" : short);
 
       const OBSERVE = new Set(["get_page", "get_editor", "click", "screenshot"]); // never warn about clicks or reads — file tab switches are fine
       let toolContent = JSON.stringify(result).slice(0, 8000);
@@ -1804,12 +1884,13 @@ async function runAgent(cfg, task, port) {
       saveConversation();
     }
   }
-  log(port, "error", cfg.auto
+  logRun("error", cfg.auto
     ? `Stopped at the auto-mode safety limit (${stepCap} steps). Send another message to continue.`
     : `Reached the ${maxSteps}-step limit. Turn on Auto mode to keep going, or send another message to continue.`);
   } finally {
     stopKeepAlive();
     try { await sendToTab(workTab.id, { action: "hide_cursor" }); } catch (e) {}
+    // cleanup lines are always shown (logRun drops writes from a cancelled run)
     if (attached) { await detachDebugger(workTab.id); log(port, "result", "Debugger detached."); }
   }
 }
@@ -1818,22 +1899,45 @@ chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== "agent") return;
   port.onMessage.addListener(async (m) => {
     if (m.type === "run") {
+      // Cancel whatever is running, take a ticket, and queue behind it
+      // SYNCHRONOUSLY (before any await) so runs can never overlap. The old
+      // run's cleanup (debugger detach on the same tab, running flag off,
+      // "finished") finishes before this one starts. If Stop / New chat / a
+      // newer Run arrives while we wait, the ticket is stale and we bail.
+      cancelRuns("superseded");
+      const ticket = currentRun;
+      const prev = runChain;
+      let release;
+      runChain = new Promise((r) => { release = r; });
+      try { await prev; } catch (e) {}
+      if (ticket !== currentRun) {
+        // cancelled while queued: if that was a Stop, say so (the run it
+        // replaced already logged "replaced by your new message")
+        if (cancelReasons[ticket] === "stop") log(port, "error", "Stopped by user.");
+        delete cancelReasons[ticket];
+        release();
+        return;
+      }
       setRunningFlag(true);
       try {
-        await runAgent(m.cfg, m.task, port);
+        await runAgent(m.cfg, m.task, port, ticket);
       } catch (e) {
         log(port, "error", "Agent crashed: " + (e && e.message || e));
       } finally {
-        setRunningFlag(false);
-        try { port.postMessage({ type: "finished" }); } catch (e) {}
+        if (ticket === currentRun) {          // a newer run owns the UI state otherwise
+          setRunningFlag(false);
+          try { port.postMessage({ type: "finished" }); } catch (e) {}
+        }
+        release();
       }
     } else if (m.type === "newchat") {
-      stopRequested = true; // halt any in-flight run so it can't write into the new chat
+      cancelRuns("newchat"); // halt any in-flight run so it can't write into the new chat
       setRunningFlag(false);
+      try { await runChain; } catch (e) {}   // let it finish logging into the OLD chat
       resetConversation();
       log(port, "assistant", "New chat started. What would you like me to do?");
     } else if (m.type === "stop") {
-      stopRequested = true;
+      cancelRuns();
       setRunningFlag(false);
     } else if (m.type === "test") {
       try {

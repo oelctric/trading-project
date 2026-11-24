@@ -78,3 +78,57 @@ was rejected so it can try something else. Read-only tools (`get_page`, `scroll`
   to refresh them after navigation.
 - Max agent steps is capped (default 15) to prevent runaway loops. Use **Stop** anytime.
 - Everything runs locally between your browser and your model — no cloud calls.
+
+
+## Bug fixes (Nov 2026)
+
+- Stop, then sending a new task, could resume the old run (two agents in one tab). Runs now
+  have ids, and Stop aborts the in-flight model request.
+- Streaming "thinking" text was appended cumulatively ("a", "a ab", ...) onto one stale line
+  and then logged again in full. It now updates one line per model call.
+- Text-format `select_option` / `drag` tool calls were ignored by the parser.
+- The page-stability poller could run forever on a tab stuck "loading".
+- Side panel: Stop did nothing if the port had dropped; Test ignored the selected model.
+
+- **Password values were sent to the model** (and stored in chat history/debug log): page
+  snapshots showed every input's current value. Password fields now show only "(filled)".
+- "type ... submit" fired Enter AND `form.requestSubmit()` -> searches/messages/posts sent twice
+  on pages that handle Enter. Now submits only if the page didn't handle Enter.
+- Typing into a `<select>` (or a field in an iframe) threw: the value setter came from the top
+  window's `HTMLInputElement`. Now uses the element's own window and type.
+- `drag` skipped the stale-element check.
+- Main-world editor scripts returned results through `window.__lmba_*`, which an isolated content
+  script can never see -> reads always fell back, and writes could be applied TWICE (main world
+  succeeded, then the textarea fallback wrote again). Results now pass via a DOM attribute.
+
+Tests: `node tests/background.test.js` (offline, mocked `chrome`);
+`JSDOM_PATH=<dir with node_modules/jsdom> node tests/content.test.js` (DOM tests; they fail on
+the old code - e.g. the old snapshot leaked the test password).
+
+Second code review (Nov 2026):
+- Stop pressed while a new run was queued behind the old one was lost; two quick Runs could
+  start together. Runs are now strictly queued with tickets - any Stop / New chat / newer Run
+  invalidates a queued or running one. New chat waits for the old run to finish logging, and a
+  cancelled run can no longer write into the new chat.
+- "type ... submit" trusted preventDefault alone: login-style forms that block Enter were never
+  submitted but reported "submitted". Now, if nothing happened after Enter, the form's submit
+  button is pressed (and the result says so).
+- waitUntilStable returned instantly on already-loaded (single-page-app) tabs, so the next read
+  could see a stale DOM; it now waits for the DOM to go quiet (max 2s).
+
+Third code review: the round-2 "press the submit button if Enter did nothing" fallback could
+submit a login/checkout TWICE on pages that cancel Enter and submit via their own slow fetch.
+It no longer auto-clicks; it reports "may NOT have submitted" so the model clicks explicitly.
+A run replaced by a new message no longer shows "Stopped by user." (it says it was replaced).
+
+Fourth code review: stopping during a batch of tool calls left some tool_calls unanswered, so
+strict OpenAI-compatible servers rejected the next request (400) - now every unrun call gets a
+"cancelled" reply (`tests/stop_midbatch.test.js`, fails on the old code). The stop reason is now
+recorded per run, so Stop + a quick new message still reports "Stopped by user.".
+
+Eighth code review: the per-run stop-reason map is cleaned up (it used to grow forever).
+
+Ninth code review: secret fields stay hidden after a "show password" toggle (type=password ->
+text), and autocomplete password / one-time-code / CVC fields and secret-looking names (pin, otp,
+token...) are redacted too. A Stop that cancels a queued task reports "Stopped by user."; cleanup
+lines like "Debugger detached." are shown even for a stopped run.

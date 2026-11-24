@@ -4,8 +4,8 @@ Alpaca crypto never closes — appealing (no gaps, always-on). But our system
 is stock/session-specific (VIX, session VWAP, ORB, gaps don't apply). This
 tests only the PRICE-BASED setups (momentum, breakout, reversal, pullback +
 short mirrors) on hourly crypto bars, with triple-barrier bracket labels,
-and reports the per-setup edge at several cost levels — because Alpaca
-crypto fees (~15-25 bps/trade) are the real question.
+and reports the per-setup edge at several ROUND-TRIP cost levels — Alpaca
+crypto fees are ~15-25 bps PER SIDE, so 30-50 bps per trade.
 
 Usage: python crypto_feasibility.py
 """
@@ -19,7 +19,6 @@ from alpaca.data.historical import CryptoHistoricalDataClient
 from alpaca.data.requests import CryptoBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
-import config
 
 COINS = ["BTC/USD", "ETH/USD", "SOL/USD", "LTC/USD", "LINK/USD",
          "AVAX/USD", "DOGE/USD", "UNI/USD", "AAVE/USD", "DOT/USD"]
@@ -99,10 +98,14 @@ def main():
     d = pd.DataFrame(rows, columns=["setup", "ret"])
     print(f"{len(d)} setup-trades across crypto\n")
 
-    for cost_bps in (5, 15, 25):
+    # ROUND-TRIP costs (fees are charged on BOTH the entry and the exit):
+    # Alpaca crypto ~0.15% maker / ~0.25% taker per side -> 30-50 bps per trade.
+    labels = {5: "stock-like", 15: "one maker side only (too optimistic)",
+              30: "maker in + maker out", 40: "maker in + market out (live bot)",
+              50: "market in + market out"}
+    for cost_bps in (5, 15, 30, 40, 50):
         cost = cost_bps / 1e4
-        print(f"=== per-trade edge at {cost_bps} bps cost "
-              f"({'stock-like' if cost_bps==5 else 'realistic crypto' if cost_bps==25 else 'optimistic crypto'}) ===")
+        print(f"=== per-trade edge at {cost_bps} bps round-trip cost ({labels[cost_bps]}) ===")
         for name in d["setup"].unique():
             r = d.loc[d["setup"] == name, "ret"].values - cost
             print(f"  {name:12s} trades={len(r):6d}  avg={r.mean()*1e4:+6.1f} bps"

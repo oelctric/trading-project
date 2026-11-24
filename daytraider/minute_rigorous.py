@@ -100,9 +100,13 @@ def main():
             atr = row["atr_pct"]
             close = row["close"]
             day_end = ts.normalize() + pd.Timedelta(hours=16)
-            entry_win = mins[(mins.index > ts)
-                             & (mins.index <= ts + pd.Timedelta(minutes=ENTRY_WINDOW_MIN))]
-            fwd_all = mins[(mins.index > ts) & (mins.index <= day_end)]
+            # hourly bars are labelled by their START: the signal only exists
+            # once the bar CLOSES, so trading may begin at ts + bar length
+            # (starting at ts used minutes from inside the signal bar itself)
+            t0 = ts + pd.Timedelta(minutes=config.BAR_MINUTES)
+            entry_win = mins[(mins.index >= t0)
+                             & (mins.index < t0 + pd.Timedelta(minutes=ENTRY_WINDOW_MIN))]
+            fwd_all = mins[(mins.index >= t0) & (mins.index <= day_end)]
             if entry_win.empty or fwd_all.empty:
                 continue
             total += 1; n += 1
@@ -133,7 +137,7 @@ def main():
           f"  sum {imm.sum():+.3f}")
     print(f"Timed(fill):avg {timed.mean()*1e4:+.1f} bps  hit {(timed>0).mean():.3f}"
           f"  sum {timed.sum():+.3f}")
-    print(f"\nP&L per signal (missed = 0):")
+    print("\nP&L per signal (missed = 0):")
     print(f"  immediate: {imm.sum()/total*1e4:+.1f} bps/signal")
     print(f"  timed:     {timed.sum()/total*1e4:+.1f} bps/signal")
     d = (timed.sum() - imm.sum()) / total * 1e4

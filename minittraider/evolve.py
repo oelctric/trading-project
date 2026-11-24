@@ -174,14 +174,16 @@ def run(sd: SymbolData, g: dict, part: str) -> tuple[float, int]:
 
         if at_sup:
             sign, zone = 1, sup
+            # probed the zone AND closed back up (OR made it always true here,
+            # so the "reject" gene had no effect - same fix as bounce.py)
             rejected = (sd.closes[i - 1] > sd.opens[i - 1]
-                        or min(sd.lows[i - 1], sd.lows[i - 2]) <= zone + 0.2 * a)
+                        and min(sd.lows[i - 1], sd.lows[i - 2]) <= zone + 0.2 * a)
             stop = zone - g["stop_atr"] * a
             target = (res - 0.2 * a) if not np.isnan(res) else price + g["target_atr"] * a
         else:
             sign, zone = -1, res
             rejected = (sd.closes[i - 1] < sd.opens[i - 1]
-                        or max(sd.highs[i - 1], sd.highs[i - 2]) >= zone - 0.2 * a)
+                        and max(sd.highs[i - 1], sd.highs[i - 2]) >= zone - 0.2 * a)
             stop = zone + g["stop_atr"] * a
             target = (sup + 0.2 * a) if not np.isnan(sup) else price - g["target_atr"] * a
 

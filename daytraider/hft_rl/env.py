@@ -41,13 +41,16 @@ def build_frame(bars: pd.DataFrame) -> pd.DataFrame:
     o["ofi"] = ((2 * c - h - l) / rng).fillna(0)              # order-flow proxy
     o["vol_z"] = (v - v.rolling(30).mean()) / v.rolling(30).std()
     o["mom5"] = np.log(c / c.shift(5))
-    b15 = bars.resample("15min").agg(high=("high", "max"), low=("low", "min"),
-                                     close=("close", "last")).dropna()
+    # end-labelled so each minute only sees COMPLETED 15-min bars (start
+    # labels leaked up to 14 future minutes into the ATR)
+    b15 = bars.resample("15min", label="right", closed="left").agg(
+        high=("high", "max"), low=("low", "min"), close=("close", "last")).dropna()
     tr = pd.concat([b15["high"] - b15["low"],
                     (b15["high"] - b15["close"].shift()).abs(),
                     (b15["low"] - b15["close"].shift()).abs()], axis=1).max(axis=1)
     atr = (tr.ewm(alpha=1/14, adjust=False).mean() / b15["close"])
     o["atr15"] = atr.reindex(o.index, method="ffill")
+    o["day"] = o.index.date
     return o.dropna()
 
 
@@ -57,7 +60,7 @@ N_ACTIONS = 3
 
 
 def _trailing_outcome(entry, atr, hi, lo, cl, short=False):
-    """Realized fractional return of a 15-min-ATR trailing exit."""
+    """(realized fractional return, bars held) of a 15-min-ATR trailing exit."""
     sgn = -1.0 if short else 1.0
     best = 0.0
     for k in range(min(HOLD_CAP, len(hi))):
@@ -65,27 +68,32 @@ def _trailing_outcome(entry, atr, hi, lo, cl, short=False):
         favlo = sgn * (lo[k] - entry) / entry if not short else (entry - hi[k]) / entry
         stop = max(-TRAIL_MULT * atr, best - TRAIL_MULT * atr)
         if favlo <= stop:
-            return stop
+            return stop, k + 1
         best = max(best, favhi)
     j = min(HOLD_CAP, len(cl)) - 1
     if j < 0:
-        return 0.0
-    return sgn * (cl[j] - entry) / entry if not short else (entry - cl[j]) / entry
+        return 0.0, 0
+    return (sgn * (cl[j] - entry) / entry if not short else (entry - cl[j]) / entry), j + 1
 
 
 class ScalperEnv:
     """Gym-convention env (reset/step). One decision per 1-min bar."""
 
     def __init__(self, frame: pd.DataFrame, ctx: ContextEngine | None = None,
-                 seed: int = 0):
+                 seed: int = 0, norm: tuple | None = None):
         self.f = frame.reset_index(drop=False)
         self.H = self.f["high"].to_numpy()
         self.L = self.f["low"].to_numpy()
         self.C = self.f["close"].to_numpy()
         self.A = self.f["atr15"].to_numpy()
         self.X = self.f[FEATURES].to_numpy(np.float32)
-        # normalize features once (z-score) for stable RL inputs
-        self.X = ((self.X - self.X.mean(0)) / (self.X.std(0) + 1e-8)).astype(np.float32)
+        # z-score with TRAINING statistics (`norm` = (mean, std)); normalizing a
+        # test env with its own mean/std peeked at the test period
+        mean, std = norm if norm is not None else (self.X.mean(0), self.X.std(0))
+        self.X = ((self.X - mean) / (std + 1e-8)).astype(np.float32)
+        # last row of each bar's session: positions never run overnight
+        day = self.f["day"]
+        self.day_end = day.groupby(day).transform(lambda s: s.index[-1]).to_numpy()
         self.ctx_engine = ctx or ContextEngine()
         self.rng = np.random.default_rng(seed)
         self.i = 0
@@ -110,21 +118,25 @@ class ScalperEnv:
                 info["vetoed"] = True
             else:
                 entry = self.C[self.i]
-                fwd = slice(self.i + 1, self.i + 1 + HOLD_CAP)
+                end = min(self.i + 1 + HOLD_CAP, self.day_end[self.i] + 1)
+                fwd = slice(self.i + 1, end)
                 # PASSIVE fill both sides (symmetric adverse selection): a
                 # long fills only if next low trades strictly BELOW the
                 # limit; a short only if next high trades strictly ABOVE it.
-                nxt_ok = self.i + 1 < len(self.L)
+                nxt_ok = self.i + 1 < end
                 if action == 1:
                     filled = nxt_ok and self.L[self.i + 1] < entry
                 else:
                     filled = nxt_ok and self.H[self.i + 1] > entry
                 if filled:
-                    realized = _trailing_outcome(
+                    realized, held = _trailing_outcome(
                         entry, atr, self.H[fwd], self.L[fwd], self.C[fwd],
                         short=(action == 2))
                     reward = (realized - FRICTION) * 1e4   # reward in bps
                     info.update(traded=True, realized_bps=realized * 1e4)
+                    # one position at a time: jump to the exit bar (it used to
+                    # advance 1 minute, letting the agent stack overlapping trades)
+                    self.i += max(held, 1) - 1
                 else:
                     info["no_fill"] = True
         # advance one bar; refresh context each minute

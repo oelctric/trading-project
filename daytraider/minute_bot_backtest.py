@@ -28,7 +28,6 @@ import pandas as pd
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
-import config
 from data import _client
 
 SUBSET = ["SPY", "QQQ", "AAPL", "NVDA", "TSLA", "AMD"]
@@ -69,8 +68,10 @@ def prep(df):
     o["rvol"] = o.groupby("hm")["volume"].transform(
         lambda v: v / v.rolling(10, min_periods=3).mean().shift(1))
     # 15-min ATR mapped onto 1-min bars (fractional)
-    b15 = df.resample("15min").agg(high=("high", "max"), low=("low", "min"),
-                                   close=("close", "last")).dropna()
+    # label each 15-min bar by its END so a minute only sees COMPLETED 15-min
+    # bars (start-labelled bars leaked up to 14 future minutes into the ATR)
+    b15 = df.resample("15min", label="right", closed="left").agg(
+        high=("high", "max"), low=("low", "min"), close=("close", "last")).dropna()
     tr = pd.concat([b15["high"] - b15["low"],
                     (b15["high"] - b15["close"].shift()).abs(),
                     (b15["low"] - b15["close"].shift()).abs()], axis=1).max(axis=1)
@@ -113,21 +114,27 @@ def main():
         rv = o["rvol"].to_numpy()
         bkt = o["bucket"]
         n = len(o)
+        # index of the last bar of each bar's session: trades never run overnight
+        day = pd.Series(o.index.date)
+        day_end = day.groupby(day).transform(lambda s: s.index[-1]).to_numpy()
         fired = 0
         for i in range(n - 2):
             if not rev[i] or np.isnan(A[i]) or A[i] <= 0:
                 continue
             if not (rv[i] > RVOL_MIN):          # RVOL veto
                 continue
-            fired += 1
-            fwd_h, fwd_l, fwd_c = H[i+1:], L[i+1:], C[i+1:]
+            end = day_end[i] + 1                # exclusive: stay in this session
+            if i + 2 >= end:
+                continue                        # no room left in the session
+            fired += 1                          # count only signals that can be traded
+            fwd_h, fwd_l, fwd_c = H[i+1:end], L[i+1:end], C[i+1:end]
             # NAIVE: enter at close[i]
             naive.append(trail_exit(C[i], A[i], fwd_h, fwd_l, fwd_c,
                                     HOLD_CAP_MIN) - cost)
             # PASSIVE: limit at close[i]; fill only if next low STRICTLY below
             limit = C[i]
             if L[i+1] < limit:                  # strict — exact touch no fill
-                pv = trail_exit(limit, A[i], H[i+2:], L[i+2:], C[i+2:],
+                pv = trail_exit(limit, A[i], H[i+2:end], L[i+2:end], C[i+2:end],
                                 HOLD_CAP_MIN) - cost
                 passive.append(pv)
                 buckets.setdefault(bkt.iloc[i], []).append(pv)

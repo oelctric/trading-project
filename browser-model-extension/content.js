@@ -65,6 +65,23 @@
     return true;
   };
 
+  // Fields whose VALUE must never reach the model: password inputs (and ones a
+  // "show password" toggle switched to type=text - remembered once seen),
+  // autocomplete password / one-time-code fields, and secret-looking names.
+  const secretSeen = new WeakSet();
+  const SECRET_NAME = /pass(word|wd|code)?|pwd|otp|one.?time|secret|token|api.?key|cvv|cvc|security.?code|pin\b/i;
+  const isSecretField = (el) => {
+    if (el.tagName !== "INPUT" && el.tagName !== "TEXTAREA") return false;
+    const type = (el.getAttribute("type") || "").toLowerCase();
+    const ac = (el.getAttribute("autocomplete") || "").toLowerCase();
+    const names = [el.getAttribute("name"), el.id, el.getAttribute("aria-label"), el.getAttribute("placeholder")].join(" ");
+    if (type === "password" || /current-password|new-password|one-time-code|cc-csc/.test(ac) ||
+        SECRET_NAME.test(names)) {
+      secretSeen.add(el);
+    }
+    return secretSeen.has(el);
+  };
+
   const labelText = (el) => {
     const tag = el.tagName;
     // For form fields, surface the CURRENT value so the model knows what's
@@ -72,6 +89,10 @@
     if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") {
       const val = (typeof el.value === "string" ? el.value : "").trim();
       const ph = el.getAttribute("placeholder") || el.getAttribute("aria-label") || el.getAttribute("name") || "";
+      // NEVER reveal a password's value: page snapshots go to the model server and
+      // are stored in the chat history / debug log.
+      const secret = isSecretField(el);
+      if (secret) return ((ph || "password") + (val ? " (filled)" : " (empty)")).replace(/\s+/g, " ").trim().slice(0, 160);
       const t = val ? `“${val}”` : (ph ? ph + " (empty)" : "(empty)");
       return t.replace(/\s+/g, " ").trim().slice(0, 160);
     }
@@ -384,12 +405,15 @@
   const rand = (a, b) => a + Math.random() * (b - a);
 
   const nativeSetValue = (el, value) => {
-    const proto = el.tagName === "TEXTAREA"
-      ? window.HTMLTextAreaElement.prototype
-      : window.HTMLInputElement.prototype;
-    const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
-    if (setter) setter.call(el, value);
-    else el.value = value;
+    // Use the setter from the element's own window and its own element type:
+    // the top window's HTMLInputElement setter throws on a <select>, and on
+    // elements that live in an iframe.
+    const win = (el.ownerDocument && el.ownerDocument.defaultView) || window;
+    const ctor = { TEXTAREA: win.HTMLTextAreaElement, SELECT: win.HTMLSelectElement }[el.tagName] || win.HTMLInputElement;
+    let setter = null;
+    try { setter = Object.getOwnPropertyDescriptor(ctor.prototype, "value")?.set; } catch (e) {}
+    try { if (setter) { setter.call(el, value); return; } } catch (e) {}
+    el.value = value;
   };
 
   // Move the "cursor" toward an element with a few intermediate mousemove events,
@@ -495,15 +519,38 @@
     }
     el.dispatchEvent(new Event("change", { bubbles: true }));
 
+    let submitNote = "";
     if (submit) {
       await sleep(rand(200, 500));
       const form = el.closest("form");
+      const urlBefore = location.href;
+      let handled = false;   // a page that handles Enter itself calls preventDefault()
       for (const type of ["keydown", "keypress", "keyup"]) {
-        el.dispatchEvent(new KeyboardEvent(type, { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true }));
+        const ev = new KeyboardEvent(type, { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true, cancelable: true });
+        if (!el.dispatchEvent(ev)) handled = true;
       }
-      if (form) form.requestSubmit ? form.requestSubmit() : form.submit();
+      if (form && !handled) {
+        form.requestSubmit ? form.requestSubmit() : form.submit();
+      } else if (form && handled) {
+        // The page cancelled Enter. Chat/search UIs then act on it themselves;
+        // login-style forms block it and expect the button; some pages submit
+        // via their own (slow) fetch. We can't tell the last two apart, and an
+        // automatic button click could send a login/purchase TWICE - so never
+        // auto-click. If nothing visibly happened, say so: the model can click
+        // the submit button explicitly.
+        await sleep(700);
+        const cur = el.isContentEditable ? (el.textContent || "") : (el.value || "");
+        const nothingHappened = el.isConnected && form.isConnected && location.href === urlBefore && cur === acc;
+        if (nothingHappened) {
+          return { ok: true, info: `${doClear ? "Typed into" : "Appended to"} [${i}] and pressed Enter, but the page ` +
+            "cancelled Enter and nothing visibly happened yet - it may NOT have submitted. Check with get_page, " +
+            "and click the form's submit button if needed." };
+        }
+      } else if (!form && handled === false) {
+        submitNote = " (Enter sent; no form found - check the page reacted)";
+      }
     }
-    return { ok: true, info: `${doClear ? "Typed into" : "Appended to"} [${i}]${submit ? " and submitted" : ""}` };
+    return { ok: true, info: `${doClear ? "Typed into" : "Appended to"} [${i}]${submit ? " and submitted" + submitNote : ""}` };
   };
 
   // elementFromPoint that descends into same-origin iframes to the real target.
@@ -617,8 +664,8 @@
   // to cover native DnD and JS libraries (dnd-kit, react-beautiful-dnd, etc.).
   const dragEl = async (fromI, toI) => {
     const a = labeledElements[fromI], b = labeledElements[toI];
-    if (!a) return { ok: false, error: `No element with index ${fromI}. Call get_page first.` };
-    if (!b) return { ok: false, error: `No element with index ${toI}. Call get_page first.` };
+    const sa = staleGuard(a, fromI); if (sa) return sa;
+    const sb = staleGuard(b, toI); if (sb) return sb;
     a.scrollIntoView({ block: "center", behavior: "instant" });
     const ra = topLevelRect(a), rb = topLevelRect(b);
     const sx = ra.left + ra.width / 2, sy = ra.top + ra.height / 2;
@@ -804,6 +851,15 @@
     return pickOption(i, value);
   };
 
+  // Read (and clear) a result an injected main-world script stored on <html>.
+  const takeMainWorldResult = (key) => {
+    const attr = "data-lmba-" + key;
+    const raw = document.documentElement.getAttribute(attr);
+    document.documentElement.removeAttribute(attr);
+    if (raw == null) return undefined;
+    try { return JSON.parse(raw); } catch (e) { return undefined; }
+  };
+
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     (async () => {
       try {
@@ -962,11 +1018,12 @@
                       }
                     }else{ window.__lmba_editor_diag.push("NO_MONACO_API_IN_THIS_CONTEXT"); }
                   }catch(e){ window.__lmba_editor_diag.push("SCAN_ERROR:" + e.message); }
+                  document.documentElement.setAttribute("data-lmba-diag", JSON.stringify(window.__lmba_editor_diag));
                 })();
               `;
               document.documentElement.appendChild(s);
               s.remove();
-              setTimeout(() => resolve(window.__lmba_editor_diag || []), 150);
+              setTimeout(() => resolve(takeMainWorldResult("diag") || ["NO_RESULT (inline scripts blocked by the page's CSP?)"]), 150);
             }).then((result) => {
               console.log("[EDITOR_INJECT_SCAN]", result.join(";"));
               sendResponse({ ok: true, info: result.join(";") });
@@ -995,11 +1052,12 @@
                     }catch(_) {}
                   };
                   scan(window.document,0);
+                  document.documentElement.setAttribute("data-lmba-get", JSON.stringify(window.__lmba_get_editor_result));
                 })();
               `;
               document.documentElement.appendChild(s);
               s.remove();
-              setTimeout(() => resolve(window.__lmba_get_editor_result), 150);
+              setTimeout(() => resolve(takeMainWorldResult("get")), 150);
             }).then((result) => {
               if (typeof result === "string") { sendResponse({ ok: true, content: result }); return; }
               // Fallback to content-script path.
@@ -1035,11 +1093,14 @@
                     }catch(_) {}
                   };
                   scan(window.document,0);
+                  document.documentElement.setAttribute("data-lmba-set", JSON.stringify(window.__lmba_set_editor_result));
                 })(${JSON.stringify(target)});
               `;
               document.documentElement.appendChild(s);
               s.remove();
-              setTimeout(() => resolve(window.__lmba_set_editor_result || null), 200);
+              // NOTE: if this result is lost the textarea fallback below would write
+              // the content a SECOND time into an editor that already has it.
+              setTimeout(() => resolve(takeMainWorldResult("set") || null), 200);
             }).then((result) => {
               if (result) { sendResponse({ ok: true, type: result.type, info: `Wrote ${result.chars} chars to Monaco editor via main world` }); return; }
 

@@ -61,8 +61,10 @@ def collect(universe, cost=5/1e4):
                   if s in config.ACTIVE_STRATEGIES}
         idx = f.index
         for m in MULTS:
+            # session-capped like the live bot (it flattens before every close)
             rl, rs = _trailing_returns(hi, lo, cl, atr, H, m,
-                                       config.SL_ATR_MULT, config.TP_BACKSTOP_ATR)
+                                       config.SL_ATR_MULT, config.TP_BACKSTOP_ATR,
+                                       session=np.asarray(f.index.date))
             for name, col in setups.items():
                 r = rs if is_short(name) else rl
                 mask = (col > 0) & ~np.isnan(r)

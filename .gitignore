@@ -35,9 +35,12 @@ logs/
 *_err.txt
 debug.txt
 trades.csv
+trades_old_format*.csv
 backtest_trades.csv
 backtest_results.txt
+swing_trades.csv
 paper_state.json
+swing_signals.json
 
 # --- Local agent / tool state ---
 .openclaude/
@@ -56,3 +59,10 @@ desktop.ini
 .vscode/
 .idea/
 *.swp
+
+# --- daytraider live-bot state ---
+pairs_state.json
+pairs_orphans.json
+stock_trail.json
+crypto_trail.json
+*.tmp

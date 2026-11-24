@@ -19,7 +19,6 @@ from __future__ import annotations
 import sys
 
 import numpy as np
-import pandas as pd
 
 import config
 from data import compute_features, download_bars

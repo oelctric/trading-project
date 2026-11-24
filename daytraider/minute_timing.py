@@ -1,5 +1,9 @@
 """Does minute-level ENTRY TIMING improve the hourly system?
 
+SUPERSEDED by minute_rigorous.py: this version is circular (it adds the
+pullback to the hourly outcome instead of re-simulating the trade). Kept for
+reference only - don't base decisions on its numbers.
+
 The hourly system decides WHAT to trade. This tests using minute bars to
 time the ENTRY: instead of entering at the signal bar's close, place a limit
 a small pullback away and enter only if the next hour's minute bars trade
@@ -74,8 +78,11 @@ def main():
                 continue
             close = row["close"]
             # minute bars in the hour AFTER the signal
-            win = mins[(mins.index > ts)
-                       & (mins.index <= ts + pd.Timedelta(minutes=window_min))]
+            # hourly bars are labelled by their START; the signal exists only
+            # after the bar closes (ts + bar length), not inside it
+            t0 = ts + pd.Timedelta(minutes=config.BAR_MINUTES)
+            win = mins[(mins.index >= t0)
+                       & (mins.index < t0 + pd.Timedelta(minutes=window_min))]
             if win.empty:
                 continue
             n += 1
@@ -107,7 +114,7 @@ def main():
         print(f"Timed entry (filled only):   avg {timed.mean()*1e4:+.1f} bps  "
               f"hit {(timed>0).mean():.3f}  sum {timed.sum():+.3f}")
     # Fair comparison: total P&L per SIGNAL (missed = 0), both scored the same
-    print(f"\nP&L per signal (missed counts as 0):")
+    print("\nP&L per signal (missed counts as 0):")
     print(f"  immediate: {imm.sum()/total*1e4:+.1f} bps/signal")
     print(f"  timed:     {timed.sum()/total*1e4:+.1f} bps/signal")
     print(f"\nVerdict: timed {'BEATS' if timed.sum() > imm.sum() else 'LOSES to'}"

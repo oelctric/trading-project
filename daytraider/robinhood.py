@@ -46,8 +46,18 @@ BASE_URL = "https://trading.robinhood.com"
 
 # ---------------------------------------------------------------- keygen --
 
-def keygen() -> None:
-    """Generate an Ed25519 key pair; store private key, show public key."""
+def keygen(force: bool = False) -> None:
+    """Generate an Ed25519 key pair; store private key, show public key.
+    Refuses to replace an existing private key unless force=True: overwriting
+    it silently would break the credential already registered on Robinhood
+    and the old key could never be recovered."""
+    env_path = config.PROJECT_ROOT / ".env"
+    existing = env_path.read_text().splitlines() if env_path.exists() else []
+    if not force and any(l.startswith("ROBINHOOD_PRIVATE_KEY=") and l.split("=", 1)[1].strip()
+                         for l in existing):
+        sys.exit("A ROBINHOOD_PRIVATE_KEY already exists in .env -- refusing to "
+                 "overwrite it. Run 'python robinhood.py keygen --force' only if you "
+                 "really want a NEW key (the old one stops working).")
     signing_key = SigningKey.generate()
     private_b64 = base64.b64encode(bytes(signing_key)).decode()
     public_b64 = base64.b64encode(bytes(signing_key.verify_key)).decode()
@@ -137,19 +147,36 @@ class RobinhoodCrypto:
                      usd_amount: float | None = None,
                      asset_quantity: float | None = None) -> dict:
         """Market order sized in USD (converted via best quote) or units."""
+        if side not in ("buy", "sell"):
+            raise ValueError(f"side must be 'buy' or 'sell', not {side!r}")
         if asset_quantity is None:
+            if not usd_amount or usd_amount <= 0:
+                raise ValueError("give a positive usd_amount or asset_quantity")
             quote = self.best_bid_ask(symbol)["results"][0]
             ref = float(quote["ask_inclusive_of_buy_spread"] if side == "buy"
                         else quote["bid_inclusive_of_sell_spread"])
-            asset_quantity = round(usd_amount / ref, 8)
+            asset_quantity = usd_amount / ref
+        qty = self._quantize(symbol, asset_quantity)
+        if qty <= 0:
+            raise ValueError(f"order size rounds to 0 {symbol} - amount too small")
         body = {
             "client_order_id": str(uuid.uuid4()),
             "side": side,
             "type": "market",
             "symbol": symbol,
-            "market_order_config": {"asset_quantity": f"{asset_quantity}"},
+            # plain decimal string: f"{1e-05}" would send "1e-05" and be rejected
+            "market_order_config": {"asset_quantity": format(qty, "f")},
         }
         return self._request("POST", "/api/v1/crypto/trading/orders/", body)
+
+    def _quantize(self, symbol: str, quantity: float):
+        """Round DOWN to the pair's asset_increment (never buy/sell more than asked)."""
+        from decimal import ROUND_DOWN, Decimal
+        try:
+            inc = Decimal(str(self.trading_pairs(symbol)["results"][0]["asset_increment"]))
+        except Exception:
+            inc = Decimal("0.00000001")
+        return (Decimal(str(quantity)) / inc).to_integral_value(rounding=ROUND_DOWN) * inc
 
     def cancel_order(self, order_id: str) -> dict:
         return self._request(
@@ -169,7 +196,7 @@ def main():
         if not args:
             print(__doc__)
             return
-        keygen()
+        keygen(force="--force" in args)
         return
 
     client = RobinhoodCrypto()

@@ -41,9 +41,9 @@ PRO_COLUMNS = ["vwap_dist", "pdh_dist", "pdl_dist", "pdc_dist",
 CANDLE_COLUMNS = ["upper_wick", "lower_wick", "clv", "delta_z",
                   "effort_result", "engulf", "hammer", "star", "doji"]
 
-# Manipulation-detector outputs fed in as features so the network can learn
-# to avoid the traps itself (fake_breakout alone is worth −13.6 bps when it
-# fires on a breakout entry — see manipulation.py).
+# Manipulation-detector outputs (tested as NN features, not used - see below).
+# The old "fake_breakout is worth -13.6 bps" note was a lookahead artifact;
+# see config.FAKE_BREAKOUT_FILTER and measure_fake_breakout.py.
 MANIP_COLUMNS = ["mf_stophunt_high", "mf_stophunt_low", "mf_absorption",
                  "mf_fake_breakout", "mf_churn"]
 
@@ -84,6 +84,11 @@ def download_bars(ticker: str, days: int = config.HISTORY_DAYS) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
     df = df.droplevel(0)  # drop the symbol level of the MultiIndex
+    # Drop a bar that hadn't finished by `end` (e.g. scanning at :18 with
+    # end=:02 returns the bar that started at :00 holding only ~2 minutes of
+    # trading). Models are trained on complete bars, so never decide on a stub.
+    bar_len = pd.Timedelta(minutes=config.BAR_MINUTES)
+    df = df[df.index + bar_len <= pd.Timestamp(end)]
     df.index = df.index.tz_convert("America/New_York")
     if "vwap" not in df.columns:
         df["vwap"] = (df["high"] + df["low"] + df["close"]) / 3
@@ -145,11 +150,17 @@ def _rsi(close: pd.Series, period: int = 14) -> pd.Series:
 
 
 def _trailing_returns(high, low, close, atr, horizon,
-                      trail_mult, sl_mult, tp_backstop):
+                      trail_mult, sl_mult, tp_backstop, session=None):
     """Per-bar trailing-stop trade return (long and short), simulated over
     the next `horizon` bars, matching the live exit logic. Returns two
-    float arrays; the final `horizon` entries are NaN (incomplete)."""
+    float arrays; the final `horizon` entries are NaN (incomplete).
+
+    `session` (one label per bar, e.g. the date): the live bot flattens
+    before every close, so a simulated trade must end at its own session's
+    last bar instead of riding overnight into the next day."""
     n = len(close)
+    if session is None:
+        session = np.zeros(n)
     rl = np.full(n, np.nan, np.float64)
     rs = np.full(n, np.nan, np.float64)
     for i in range(n - horizon):
@@ -157,9 +168,18 @@ def _trailing_returns(high, low, close, atr, horizon,
         if not np.isfinite(a) or a <= 0:
             continue
         sl0, trail, tp = sl_mult * a, trail_mult * a, tp_backstop * a
+        # last bar this trade may live on: horizon, capped at the session end
+        last = i + horizon
+        for k in range(1, horizon + 1):
+            if session[i + k] != session[i]:
+                last = i + k - 1
+                break
+        span = last - i
+        if span == 0:
+            continue    # last bar of its session: no trade possible -> NaN, not 0
         # long
         best, out_l = 0.0, None
-        for k in range(1, horizon + 1):
+        for k in range(1, span + 1):
             favhi = (high[i + k] - entry) / entry
             favlo = (low[i + k] - entry) / entry
             stop = max(-sl0, best - trail)
@@ -168,10 +188,10 @@ def _trailing_returns(high, low, close, atr, horizon,
             if favhi >= tp:
                 out_l = tp; break
             best = max(best, favhi)
-        rl[i] = out_l if out_l is not None else close[i + horizon] / entry - 1
+        rl[i] = out_l if out_l is not None else close[last] / entry - 1
         # short (mirror: profit when price falls)
         best, out_s = 0.0, None
-        for k in range(1, horizon + 1):
+        for k in range(1, span + 1):
             favlo = (entry - high[i + k]) / entry  # adverse for short
             favhi = (entry - low[i + k]) / entry   # favorable for short
             stop = max(-sl0, best - trail)
@@ -180,7 +200,7 @@ def _trailing_returns(high, low, close, atr, horizon,
             if favhi >= tp:
                 out_s = tp; break
             best = max(best, favhi)
-        rs[i] = out_s if out_s is not None else 1 - close[i + horizon] / entry
+        rs[i] = out_s if out_s is not None else 1 - close[last] / entry
     return rl.astype(np.float32), rs.astype(np.float32)
 
 
@@ -341,20 +361,35 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     sl_dist = config.SL_ATR_MULT * atr
     horizon = config.LABEL_HORIZON
 
+    # The live bot flattens every position before the close, so a simulated
+    # trade may only use bars from its OWN session (it used to ride overnight
+    # into the next day - a different trade from the one the bot makes).
+    session = pd.Series(out.index.date, index=out.index)
+    same_session = {k: (session.shift(-k) == session) for k in range(1, horizon + 1)}
+
     def barrier_ret(profit_lvl, stop_lvl, profit_side_hits, stop_side_hits,
                     exit_ret):
         first_tp = pd.Series(np.inf, index=out.index)
         first_sl = pd.Series(np.inf, index=out.index)
         for k in range(1, horizon + 1):
+            ok = same_session[k]
             first_tp = first_tp.mask(
-                profit_side_hits(k, profit_lvl) & np.isinf(first_tp), k)
+                profit_side_hits(k, profit_lvl) & ok & np.isinf(first_tp), k)
             first_sl = first_sl.mask(
-                stop_side_hits(k, stop_lvl) & np.isinf(first_sl), k)
+                stop_side_hits(k, stop_lvl) & ok & np.isinf(first_sl), k)
         return np.where(
             np.isfinite(first_sl) & (first_sl <= first_tp), -sl_dist,
             np.where(np.isfinite(first_tp), tp_dist, exit_ret))
 
-    horizon_ret = close.shift(-horizon) / close - 1
+    # no barrier hit: exit at the last bar of the horizon THAT IS STILL IN THE
+    # SAME SESSION (the live bot's end-of-day flatten)
+    exit_close = close.copy()
+    for k in range(1, horizon + 1):
+        exit_close = exit_close.mask(same_session[k], close.shift(-k))
+    horizon_ret = exit_close / close - 1
+    # the last bar of a session has no same-session bar to trade into: its
+    # label must be "unknown" (NaN), not a fake 0 return / losing target
+    no_room = ~same_session[1]
     out["trade_ret"] = barrier_ret(
         close * (1 + tp_dist), close * (1 - sl_dist),
         lambda k, lvl: high.shift(-k) >= lvl,
@@ -365,6 +400,7 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
         lambda k, lvl: low.shift(-k) <= lvl,
         lambda k, lvl: high.shift(-k) >= lvl,
         -horizon_ret)
+    out.loc[no_room, ["trade_ret", "trade_ret_short"]] = np.nan
 
     # Trailing-exit returns matching the LIVE bot (SL -1 ATR, trail
     # TRAIL_ATR_MULT behind the best price, far TP backstop, horizon exit).
@@ -373,7 +409,8 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     tl, ts = _trailing_returns(
         high.to_numpy(), low.to_numpy(), close.to_numpy(),
         atr.to_numpy(), horizon,
-        config.TRAIL_ATR_MULT, config.SL_ATR_MULT, config.TP_BACKSTOP_ATR)
+        config.TRAIL_ATR_MULT, config.SL_ATR_MULT, config.TP_BACKSTOP_ATR,
+        session=np.asarray(out.index.date))
     out["trail_ret"] = tl
     out["trail_ret_short"] = ts
     # Bars too recent to have a full horizon get NaN labels; they are
@@ -425,7 +462,9 @@ def load_dataset(tickers=config.TICKERS, seq_len: int = config.SEQ_LEN,
     Results are cached on disk so consecutive train/backtest runs don't
     re-download everything.
     """
-    cache = config.MODEL_DIR / "dataset_v2.npz"
+    # v3: session-capped + purged labels, NaN on last-bar-of-session.
+    # Bump the name whenever label logic changes so stale caches aren't reused.
+    cache = config.MODEL_DIR / "dataset_v3.npz"
     if cache.exists():
         age_h = (_time.time() - cache.stat().st_mtime) / 3600
         if age_h < max_cache_age_hours:
@@ -448,9 +487,16 @@ def load_dataset(tickers=config.TICKERS, seq_len: int = config.SEQ_LEN,
         n = len(feats)
         i_train = int(n * config.TRAIN_FRAC)
         i_val = int(n * (config.TRAIN_FRAC + config.VAL_FRAC))
-        parts = {"train": feats.iloc[:i_train],
-                 "val": feats.iloc[i_train:i_val],
+        parts = {"train": feats.iloc[:i_train].copy(),
+                 "val": feats.iloc[i_train:i_val].copy(),
                  "test": feats.iloc[i_val:]}
+        # Purge: labels look LABEL_HORIZON bars ahead, so the last bars of
+        # train (and val) are graded on prices from the NEXT split - a leak.
+        # Drop those labels (build_sequences skips NaN-label windows).
+        label_cols = ["trade_ret", "trade_ret_short", "trail_ret", "trail_ret_short"]
+        for name in ("train", "val"):
+            part = parts[name]
+            part.loc[part.index[-config.LABEL_HORIZON:], label_cols] = np.nan
         for name, part in parts.items():
             splits[name].append(build_sequences(part, seq_len))
         print(f"  {ticker}: {n} usable bars")

@@ -24,7 +24,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 import config
 from data import FEATURE_COLUMNS, compute_features, download_bars
-from model import DayTraderNet, Scaler
+from model import DayTraderNet
 
 NEW = ["breadth", "xs_rev_rank"]
 COLS = FEATURE_COLUMNS + NEW

@@ -30,7 +30,7 @@ def main():
     Xtr, ytr = ds["train"][0][:, -1, :], ds["train"][1]   # last-bar features
     Xva, yva = ds["val"][0][:, -1, :], ds["val"][1]
     Xte = ds["test"][0]
-    yte = ds["test"][1]
+
     ret_long, ret_short, setups = ds["test"][2], ds["test"][3], ds["test"][4]
 
     print("Training XGBoost ranker...")
@@ -73,7 +73,7 @@ def main():
         lstm_edge.append(lt - lb); xgb_edge.append(xt - xb)
         print(f"{name:16s}   {lt:+5.1f}/{lb:+5.1f} bps    {xt:+5.1f}/{xb:+5.1f} bps")
 
-    print(f"\nMean top-minus-bottom edge (higher = better ranking):")
+    print("\nMean top-minus-bottom edge (higher = better ranking):")
     print(f"  LSTM: {np.mean(lstm_edge):+.1f} bps")
     print(f"  XGB:  {np.mean(xgb_edge):+.1f} bps")
     print(f"\n{'XGB ranks better' if np.mean(xgb_edge) > np.mean(lstm_edge) else 'LSTM ranks better (keep it)'}")

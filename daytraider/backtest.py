@@ -1,8 +1,9 @@
 """Backtest on the held-out test period, per strategy (long and short).
 
-Each fired setup is scored with its simulated ATR-bracket outcome in the
-strategy's direction (take-profit / stop-loss / horizon exit — same rules
-the live bot trades), with costs charged per trade.
+Each fired setup is scored with its simulated FIXED ATR-bracket outcome in
+the strategy's direction (take-profit / stop-loss / same-session exit), with
+costs charged per trade. NOTE: the live bot exits with a TRAILING stop - the
+trailing-exit evaluation of the actual system is walkforward.py.
 """
 from __future__ import annotations
 
@@ -12,7 +13,7 @@ import torch
 import config
 from data import load_dataset
 from model import Scaler, ensemble_probs, load_ensemble, load_threshold
-from strategies import STRATEGY_COLUMNS, STRATEGY_NAMES, is_short
+from strategies import STRATEGY_NAMES, is_short
 
 
 def stats(rets: np.ndarray, mask: np.ndarray) -> dict:
@@ -23,7 +24,8 @@ def stats(rets: np.ndarray, mask: np.ndarray) -> dict:
     return {"trades": len(r),
             "hit": float((r > 0).mean()),
             "avg": float(r.mean()),
-            "total": float(np.exp(r.sum()) - 1)}
+            # simple returns compound by multiplying (exp(sum) is for log returns)
+            "total": float(np.prod(1 + r) - 1)}
 
 
 def report(label: str, s: dict):

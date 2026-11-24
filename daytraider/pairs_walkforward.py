@@ -77,19 +77,18 @@ def trade_pair(a, b, beta, test):
     spread = test[a] - beta * test[b]
     z = (spread - spread.rolling(Z_WIN, min_periods=20).mean()) \
         / spread.rolling(Z_WIN, min_periods=20).std()
-    pos, entry, rets = 0, 0.0, []
+    pos, entry, notional, rets = 0, 0.0, 1.0, []
     for t in range(1, len(z)):
         zt = z.iloc[t]
         if not np.isfinite(zt):
             continue
         if pos == 0:
-            if zt > ENTRY_Z:
-                pos, entry = -1, spread.iloc[t]
-            elif zt < -ENTRY_Z:
-                pos, entry = 1, spread.iloc[t]
+            if abs(zt) > ENTRY_Z:
+                pos, entry = (-1 if zt > 0 else 1), spread.iloc[t]
+                # capital committed is measured at ENTRY (was measured at exit)
+                notional = abs(test[a].iloc[t]) + abs(beta) * abs(test[b].iloc[t])
         else:
             if abs(zt) < EXIT_Z or abs(zt) > STOP_Z:
-                notional = abs(test[a].iloc[t]) + abs(beta) * abs(test[b].iloc[t])
                 rets.append((pos * (spread.iloc[t] - entry)) / notional)
                 pos = 0
     return rets
@@ -118,6 +117,8 @@ def main():
         n_pairs_held.append(len(pairs))
         period = []
         for a, b, beta in pairs:
+            if beta <= 0:
+                continue      # the live bot skips negative-beta pairs - measure what is traded
             for r in trade_pair(a, b, beta, test):
                 period.append(r - cost)
         if period:

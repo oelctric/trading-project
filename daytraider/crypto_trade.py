@@ -7,6 +7,12 @@ gate it is fragile and outlier-dependent. It is built to run on PAPER so
 forward results can tell us whether the edge is real. Do not point it at a
 funded account.
 
+UPDATE Nov 2026 - re-validated at the REAL round-trip cost (maker in ~15 bps +
+market out ~25 bps = 40 bps; it used to be charged 15): trailing exit +3.9 bps
+per trade over 8,925 trades, only 44% of months positive, and one month
+(Feb 2026) contributes more than the entire net total. Without it the strategy
+loses money. Treat it as having NO reliable edge.
+
 Strategy: long-only oversold-RSI bounce (the one crypto setup with raw
 edge), on liquid coins, entered with maker limit orders, exited with a
 1-ATR trailing stop managed in-loop (Alpaca crypto has no resting brackets).
@@ -31,6 +37,7 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest
 
+import botstate
 import config
 
 COINS = ["BTC/USD", "ETH/USD", "SOL/USD", "LTC/USD", "LINK/USD",
@@ -47,9 +54,21 @@ MAKER_BUFFER = 0.0010        # limit this far below price for a maker fill
 DAILY_LOSS_LIMIT = 0.03      # crypto is volatile; wider than the 1% stock cap
 SCAN_SECONDS = 900           # manage exits every 15 min; enter hourly
 REGIME_LOOKBACK_DAYS = 30
+# round trip as traded: maker limit entry ~0.15% + MARKET (taker) exit ~0.25%
+ROUND_TRIP_COST = 0.0040
 
 _data = CryptoHistoricalDataClient()
-_trail: dict[str, dict] = {}   # symbol -> {dist, hwm, atr}
+_trail: dict[str, dict] = botstate.load(botstate.CRYPTO_TRAIL, {})   # symbol -> {dist, hwm}
+
+
+def price_round(price: float) -> float:
+    """Round a limit price to ~6 significant digits. Rounding to 2 decimals
+    (the old code) moves a $0.08 coin by up to ~6% (never fills) and turns
+    a sub-cent coin into $0.00."""
+    if price <= 0:
+        return price
+    decimals = max(2, 5 - int(np.floor(np.log10(price))))
+    return round(price, decimals)
 
 
 def norm(sym: str) -> str:     # position symbol "BTCUSD" -> "BTC/USD"
@@ -85,11 +104,16 @@ def _rsi(c, n=14):
 
 
 def load_bars(days=75) -> dict[str, pd.DataFrame]:  # need 30d for vol median
-    end = datetime.now(timezone.utc) - timedelta(minutes=5)
+    # crypto bars are real time: ask up to NOW (an end of now-5min dropped the
+    # hour that had just closed whenever the scan ran at :00-:05)
+    end = datetime.now(timezone.utc)
     req = CryptoBarsRequest(symbol_or_symbols=COINS,
                             timeframe=TimeFrame(1, TimeFrameUnit.Hour),
                             start=end - timedelta(days=days), end=end)
     df = _data.get_crypto_bars(req).df
+    # drop the hour that hasn't finished yet - signals only on complete bars
+    ts = df.index.get_level_values(-1)
+    df = df[ts + pd.Timedelta(hours=1) <= pd.Timestamp(end)]
     out = {}
     for coin in df.index.get_level_values(0).unique():
         o = df.xs(coin).copy()
@@ -118,7 +142,7 @@ def regime_ok(bars) -> bool:
             loc = o.index.get_loc(ts)
             if loc + 8 < len(o):
                 r = o["close"].iloc[loc + 8] / o["close"].iloc[loc] - 1
-                pnl += r - 0.0015
+                pnl += r - ROUND_TRIP_COST
                 n += 1
     print(f"  regime pnl(30d): {pnl:+.3f} over {n} signals -> "
           f"{'TRADE' if pnl > 0 else 'SIT OUT'}")
@@ -148,6 +172,7 @@ def manage_exits(client, bars):
                 _trail.pop(sym, None)
             except Exception as e:
                 print(f"  sell failed {sym}: {e}")
+    botstate.save(botstate.CRYPTO_TRAIL, _trail)
 
 
 def cancel_stale_orders(client):
@@ -209,12 +234,13 @@ def enter(client, bars):
         qty = round(notional / price, 6)
         if qty * price < 1:
             continue
-        limit = round(price * (1 - MAKER_BUFFER), 2)
+        limit = price_round(price * (1 - MAKER_BUFFER))
         try:
             client.submit_order(LimitOrderRequest(
                 symbol=coin, qty=qty, side=OrderSide.BUY,
                 time_in_force=TimeInForce.GTC, limit_price=limit))
             _trail[coin] = {"dist": TRAIL_ATR * atr * price, "hwm": price}
+            botstate.save(botstate.CRYPTO_TRAIL, _trail)
             print(f"  BUY {qty} {coin} lmt={limit} (~${notional:,.0f})")
         except Exception as e:
             print(f"  buy failed {coin}: {e}")

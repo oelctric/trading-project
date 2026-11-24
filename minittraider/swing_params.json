@@ -1,0 +1,28 @@
+{
+ "tf": "1d",
+ "params": {
+  "fast": 20,
+  "slow": 100,
+  "breakout": 20,
+  "er_len": 20,
+  "er_min": 0.2,
+  "atr_len": 14,
+  "init_stop_atr": 2.0,
+  "be_r": 1.0,
+  "trail_atr": 4.0,
+  "tight_r": 3.0,
+  "tight_atr": 2.0,
+  "stall_bars": 10,
+  "stall_r": 0.5,
+  "max_hold_bars": 365,
+  "min_risk_fees": 3.0,
+  "allow_short": true,
+  "regime_len": 0,
+  "mode": "breakout",
+  "filters": [
+   "calm_vol",
+   "macd"
+  ]
+ },
+ "note": "Retrained Nov 2026 (retrain.py). Picked by the walk-forward retrain at the start of 2024 and again 2026 (data before each year only); beat the previous settings on unseen 2024-now data ($175 vs $156 per $100, drawdown 37% vs 32%). Nov 2026: added calm_vol indicator filter (skip breakouts when ATR% is in the top 20% of its past year) - best single indicator on 2016-23, confirmed on unseen 2023-now. Nov 2026 round 2: added macd (standard 12/26/9) - only one of 11 new indicators that helped on both 2016-23 and unseen 2023-now; mainly lowers drawdowns."
+}
